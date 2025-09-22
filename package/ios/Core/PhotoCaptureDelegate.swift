@@ -17,11 +17,13 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
   private let metadataProvider: MetadataProvider
   private let path: URL
 
-  required init(promise: Promise,
-                enableShutterSound: Bool,
-                metadataProvider: MetadataProvider,
-                path: URL,
-                cameraSessionDelegate: CameraSessionDelegate?) {
+  required init(
+    promise: Promise,
+    enableShutterSound: Bool,
+    metadataProvider: MetadataProvider,
+    path: URL,
+    cameraSessionDelegate: CameraSessionDelegate?
+  ) {
     self.promise = promise
     self.enableShutterSound = enableShutterSound
     self.metadataProvider = metadataProvider
@@ -41,7 +43,9 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     cameraSessionDelegate?.onCaptureShutter(shutterType: .photo)
   }
 
-  func photoOutput(_: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+  func photoOutput(
+    _: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?
+  ) {
     defer {
       removeGlobal()
     }
@@ -51,17 +55,26 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     }
 
     do {
-      try FileUtils.writePhotoToFile(photo: photo,
-                                     metadataProvider: metadataProvider,
-                                     file: path)
+      try FileUtils.writePhotoToFile(
+        photo: photo,
+        metadataProvider: metadataProvider,
+        file: path)
 
       let exif = photo.metadata["{Exif}"] as? [String: Any]
       let width = exif?["PixelXDimension"]
       let height = exif?["PixelYDimension"]
-      let exifOrientation = photo.metadata[String(kCGImagePropertyOrientation)] as? UInt32 ?? CGImagePropertyOrientation.up.rawValue
-      let cgOrientation = CGImagePropertyOrientation(rawValue: exifOrientation) ?? CGImagePropertyOrientation.up
+      let exifOrientation =
+        photo.metadata[String(kCGImagePropertyOrientation)] as? UInt32
+        ?? CGImagePropertyOrientation.up.rawValue
+      let cgOrientation =
+        CGImagePropertyOrientation(rawValue: exifOrientation) ?? CGImagePropertyOrientation.up
       let orientation = getOrientation(forExifOrientation: cgOrientation)
       let isMirrored = getIsMirrored(forExifOrientation: cgOrientation)
+
+      var depthDataResult: [String: Any]? = nil
+      if let depthData = photo.depthData {
+        depthDataResult = processDepthData(depthData)
+      }
 
       promise.resolve([
         "path": path.absoluteString,
@@ -72,15 +85,20 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         "isRawPhoto": photo.isRawPhoto,
         "metadata": photo.metadata,
         "thumbnail": photo.embeddedThumbnailPhotoFormat as Any,
+        "depthData": depthDataResult as Any,
       ])
     } catch let error as CameraError {
       promise.reject(error: error)
     } catch {
-      promise.reject(error: .capture(.unknown(message: "An unknown error occured while capturing the photo!")), cause: error as NSError)
+      promise.reject(
+        error: .capture(.unknown(message: "An unknown error occured while capturing the photo!")),
+        cause: error as NSError)
     }
   }
 
-  func photoOutput(_: AVCapturePhotoOutput, didFinishCaptureFor _: AVCaptureResolvedPhotoSettings, error: Error?) {
+  func photoOutput(
+    _: AVCapturePhotoOutput, didFinishCaptureFor _: AVCaptureResolvedPhotoSettings, error: Error?
+  ) {
     defer {
       removeGlobal()
     }
@@ -94,7 +112,43 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     }
   }
 
-  private func getOrientation(forExifOrientation exifOrientation: CGImagePropertyOrientation) -> String {
+  private func processDepthData(_ depthData: AVDepthData) -> [String: Any] {
+    let depthDataMap = depthData.depthDataMap
+    let depthDataType = depthData.depthDataType
+
+    // Lock the pixel buffer for reading
+    CVPixelBufferLockBaseAddress(depthDataMap, .readOnly)
+    defer {
+      CVPixelBufferUnlockBaseAddress(depthDataMap, .readOnly)
+    }
+
+    // Get pixel buffer properties
+    let width = CVPixelBufferGetWidth(depthDataMap)
+    let height = CVPixelBufferGetHeight(depthDataMap)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(depthDataMap)
+
+    // Get base address of pixel data
+    guard let baseAddress = CVPixelBufferGetBaseAddress(depthDataMap) else {
+      return [:]
+    }
+
+    // Calculate total data size
+    let dataSize = height * bytesPerRow
+    let data = Data(bytes: baseAddress, count: dataSize)
+    let base64String = data.base64EncodedString()
+
+    return [
+      "data": base64String,
+      "format": depthDataType,
+      "width": width,
+      "height": height,
+      "bytesPerRow": bytesPerRow,
+    ]
+  }
+
+  private func getOrientation(forExifOrientation exifOrientation: CGImagePropertyOrientation)
+    -> String
+  {
     switch exifOrientation {
     case .up, .upMirrored:
       return "portrait"
@@ -109,7 +163,8 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     }
   }
 
-  private func getIsMirrored(forExifOrientation exifOrientation: CGImagePropertyOrientation) -> Bool {
+  private func getIsMirrored(forExifOrientation exifOrientation: CGImagePropertyOrientation) -> Bool
+  {
     switch exifOrientation {
     case .upMirrored, .rightMirrored, .downMirrored, .leftMirrored:
       return true

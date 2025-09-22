@@ -38,6 +38,20 @@ export interface TakePhotoOptions {
    * @default true
    */
   enableShutterSound?: boolean
+
+  /**
+   * Whether to capture depth data along with the photo.
+   * 
+   * Depth data provides distance information for each pixel,
+   * enabling features like anti-spoofing detection and 3D reconstruction.
+   * 
+   * Only available on devices with depth-sensing capabilities
+   * (TrueDepth, LiDAR, or dual cameras).
+   * 
+   * @platform iOS
+   * @default false
+   */
+  enableDepthData?: boolean
 }
 
 /**
@@ -151,4 +165,35 @@ export interface PhotoFile extends TemporaryFile {
       MeteringMode: number
     }
   }
+  /**
+   * Depth data captured along with the photo, if available.
+   * 
+   * Contains distance information for each pixel in the image,
+   * useful for anti-spoofing detection and 3D applications.
+   * 
+   * @platform iOS
+   */
+  depthData?: {
+    /**
+     * Base64-encoded depth map data
+     */
+    data: string
+    /**
+     * Depth data format identifier
+     * Common values: kCVPixelFormatType_DisparityFloat32, kCVPixelFormatType_DepthFloat32
+     */
+    format: number
+    /**
+     * Width of the depth map in pixels
+     */
+    width: number
+    /**
+     * Height of the depth map in pixels
+     */
+    height: number
+    /**
+     * Bytes per row in the depth map
+     */
+    bytesPerRow: number
+  } 
 }
