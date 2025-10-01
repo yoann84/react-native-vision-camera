@@ -166,6 +166,14 @@ export interface PhotoFile extends TemporaryFile {
     }
   }
   /**
+   * Base64-encoded cropped face image, if face detection was enabled and successful.
+   * 
+   * Only present when enableDepthData is true and exactly one face is detected.
+   * 
+   * @platform iOS
+   */
+  croppedImage?: string
+  /**
    * Depth data captured along with the photo, if available.
    * 
    * Contains distance information for each pixel in the image,

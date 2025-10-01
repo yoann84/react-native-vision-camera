@@ -51,7 +51,7 @@ extension CameraSession {
 
       // depth data
       photoSettings.isDepthDataDeliveryEnabled =
-        options.enableDepthData && photoOutput.isDepthDataDeliverySupported
+        options.enableDepthData && photoOutput.isDepthDataDeliveryEnabled
       if #available(iOS 12.0, *) {
         photoSettings.isPortraitEffectsMatteDeliveryEnabled =
           photoOutput.isPortraitEffectsMatteDeliveryEnabled
@@ -89,6 +89,7 @@ extension CameraSession {
         enableShutterSound: options.enableShutterSound,
         metadataProvider: self.metadataProvider,
         path: options.path,
+        enableDepthData: options.enableDepthData,
         cameraSessionDelegate: self.delegate)
       photoOutput.capturePhoto(with: photoSettings, delegate: photoCaptureDelegate)
 
