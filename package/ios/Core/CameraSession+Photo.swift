@@ -50,8 +50,8 @@ extension CameraSession {
       }
 
       // depth data
-      photoSettings.isDepthDataDeliveryEnabled =
-        options.enableDepthData && photoOutput.isDepthDataDeliveryEnabled
+      let shouldEnableDepthData = options.enableDepthData && photoOutput.isDepthDataDeliveryEnabled
+      photoSettings.isDepthDataDeliveryEnabled = shouldEnableDepthData
       if #available(iOS 12.0, *) {
         photoSettings.isPortraitEffectsMatteDeliveryEnabled =
           photoOutput.isPortraitEffectsMatteDeliveryEnabled

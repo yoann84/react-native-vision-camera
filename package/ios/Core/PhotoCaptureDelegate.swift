@@ -94,11 +94,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     let hasDepthData = photo.depthData != nil
     let hasImageData = photo.fileDataRepresentation() != nil
 
-    print("🔍 Face cropping check:")
-    print("  - hasDepthData: \(hasDepthData)")
-    print("  - hasImageData: \(hasImageData)")
-    print("  - enableDepthData: \(enableDepthData)")
-
     return hasDepthData && hasImageData
   }
 
