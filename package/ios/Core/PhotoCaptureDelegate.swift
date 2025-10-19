@@ -69,7 +69,8 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     } catch {
       promise.reject(
         error: .capture(.unknown(message: "An unknown error occured while capturing the photo!")),
-        cause: error as NSError)
+        cause: error as NSError
+      )
     }
   }
 
@@ -102,7 +103,8 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     try FileUtils.writePhotoToFile(
       photo: photo,
       metadataProvider: metadataProvider,
-      file: path)
+      file: path
+    )
 
     // Extract basic metadata
     let exif = photo.metadata["{Exif}"] as? [String: Any]
@@ -122,7 +124,9 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
     if shouldProcessFaceCropping(photo: photo) {
       do {
-        let result = try processFaceCropping(photo: photo, exifOrientation: cgOrientation)
+        print("orientation raw value: \(orientation)")
+        print("isMirrored: \(isMirrored)")
+        let result = try processFaceCropping(photo: photo, exifOrientation: exifOrientation)
         croppedImageBase64 = result.croppedImageBase64
         finalWidth = result.croppedWidth
         finalHeight = result.croppedHeight
@@ -172,7 +176,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
   private func processFaceCropping(
     photo: AVCapturePhoto,
-    exifOrientation: CGImagePropertyOrientation
+    exifOrientation: UInt32
   ) throws -> FaceCroppingResult {
     // Extract image and metadata
     guard let imageData = photo.fileDataRepresentation(),
@@ -182,24 +186,42 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     }
 
     // Store for depth data processing later
-    self.lastProcessedImageSize = image.size
+    lastProcessedImageSize = image.size
 
-    // Detect single face
-    let faceObservation = try detectSingleFace(in: image)
+    // Detect single face with proper orientation and depth data for anti-spoofing
+    let faceObservation = try detectSingleFace(
+      in: image, photo: photo, exifOrientation: exifOrientation
+    )
 
-    // Convert face coordinates to image pixels
+    // Use Vision framework results directly - no manual coordinate conversion needed
     let imageSize = image.size
+
+    // Convert normalized coordinates to pixel coordinates
+    // Vision framework already handles orientation correctly
     let faceRect = VNImageRectForNormalizedRect(
       faceObservation.boundingBox,
       Int(imageSize.width),
       Int(imageSize.height)
     )
 
-    // Store face rect for depth data processing later
-    self.lastProcessedFaceRect = faceRect
+    // Essential debug info
+    print("Face rect: \(faceRect)")
+    print("Image size: \(imageSize)")
 
-    // Crop image
-    let croppedImage = try cropImage(image, to: faceRect)
+    // Apply X-axis flip for mirrored images (front camera is always mirrored)
+    let finalFaceRect = CGRect(
+      x: imageSize.width - faceRect.maxX,  // Flip X-axis for mirrored
+      y: faceRect.origin.y,  // Keep Y-axis as is
+      width: faceRect.width,
+      height: faceRect.height
+    )
+    print("Flipped rect: \(finalFaceRect)")
+
+    // Store face rect for depth data processing later (use original Vision coordinates for depth processing)
+    lastProcessedFaceRect = faceRect
+
+    // Crop image with final coordinates
+    let croppedImage = try cropImage(image, to: finalFaceRect)
 
     // Convert cropped image to base64
     guard let croppedImageData = croppedImage.jpegData(compressionQuality: 1.0) else {
@@ -213,7 +235,9 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     )
   }
 
-  private func detectSingleFace(in image: UIImage) throws -> VNFaceObservation {
+  private func detectSingleFace(in image: UIImage, photo: AVCapturePhoto, exifOrientation: UInt32)
+    throws -> VNFaceObservation
+  {
     guard let cgImage = image.cgImage else {
       throw CameraError.capture(.unknown(message: "Failed to get CGImage from photo"))
     }
@@ -239,7 +263,31 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       semaphore.signal()
     }
 
-    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    // Create handler with proper orientation for accurate coordinate mapping
+    // Use the exifOrientation from processPhoto function
+    let cgOrientation: CGImagePropertyOrientation
+    if let orientation = CGImagePropertyOrientation(rawValue: exifOrientation) {
+      print(
+        "exifOrientation used for face detection: \(exifOrientation) and brut force orientation: \(orientation)"
+      )
+      cgOrientation = orientation
+    } else {
+      print(
+        "Warning: Failed to convert exifOrientation to CGImagePropertyOrientation, using .up as fallback"
+      )
+      cgOrientation = .up
+    }
+
+    // Use standard image handler for now (depth data integration can be added later)
+    let handler = VNImageRequestHandler(
+      cgImage: cgImage, orientation: cgOrientation, options: [:]
+    )
+
+    if photo.depthData != nil {
+      print("Depth data available")
+    } else {
+      print("Using standard face detection (no depth data available)")
+    }
     try handler.perform([request])
     semaphore.wait()
 
@@ -252,6 +300,77 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     }
 
     return face
+  }
+
+  private func createPixelBuffer(from cgImage: CGImage) -> CVPixelBuffer? {
+    let width = cgImage.width
+    let height = cgImage.height
+
+    var pixelBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+      kCFAllocatorDefault,
+      width,
+      height,
+      kCVPixelFormatType_32BGRA,
+      nil,
+      &pixelBuffer
+    )
+
+    guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+      return nil
+    }
+
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+    let pixelData = CVPixelBufferGetBaseAddress(buffer)
+    let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+    let context = CGContext(
+      data: pixelData,
+      width: width,
+      height: height,
+      bitsPerComponent: 8,
+      bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+      space: rgbColorSpace,
+      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+    )
+
+    context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    return buffer
+  }
+
+  private func testCoordinateTransformation(
+    imageSize: CGSize,
+    faceRect: CGRect,
+    flippedRect: CGRect,
+    orientation: UIImage.Orientation
+  ) {
+    print("=== COORDINATE TRANSFORMATION TEST ===")
+    print("Image: \(imageSize.width)x\(imageSize.height), Orientation: \(orientation)")
+    print("Vision rect: \(faceRect)")
+    print("Flipped rect: \(flippedRect)")
+
+    // Test if coordinates are within bounds
+    let imageBounds = CGRect(x: 0, y: 0, width: imageSize.width, height: imageSize.height)
+    let visionInBounds = imageBounds.contains(faceRect)
+    let flippedInBounds = imageBounds.contains(flippedRect)
+
+    print("Vision rect in bounds: \(visionInBounds)")
+    print("Flipped rect in bounds: \(flippedInBounds)")
+
+    // Test different coordinate systems
+    let testRect = CGRect(x: 100, y: 100, width: 200, height: 200)
+    let testFlipped = CGRect(
+      x: testRect.origin.x,
+      y: imageSize.height - testRect.maxY,
+      width: testRect.width,
+      height: testRect.height
+    )
+
+    print("Test rect: \(testRect)")
+    print("Test flipped: \(testFlipped)")
+    print("=== END TEST ===")
   }
 
   private func cropImage(_ image: UIImage, to rect: CGRect) throws -> UIImage {
@@ -383,7 +502,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     imageSize: CGSize,
     exifOrientation: CGImagePropertyOrientation
   ) throws -> [String: Any] {
-
     // Apply orientation to depth data
     let orientedDepthData = depthData.applyingExifOrientation(exifOrientation)
 
