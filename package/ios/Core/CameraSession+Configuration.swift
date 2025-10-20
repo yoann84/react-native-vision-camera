@@ -68,7 +68,7 @@ extension CameraSession {
     codeScannerOutput = nil
 
     // Photo Output
-    if case let .enabled(photo) = configuration.photo {
+    if case .enabled(let photo) = configuration.photo {
       VisionLogger.log(level: .info, message: "Adding Photo output...")
 
       // 1. Add
@@ -80,11 +80,14 @@ extension CameraSession {
 
       // 2. Configure
       if #available(iOS 13.0, *) {
-        let qualityPrioritization = AVCapturePhotoOutput.QualityPrioritization(fromQualityBalance: photo.qualityBalance)
+        let qualityPrioritization = AVCapturePhotoOutput.QualityPrioritization(
+          fromQualityBalance: photo.qualityBalance)
         photoOutput.maxPhotoQualityPrioritization = qualityPrioritization
       }
       if photoOutput.isDepthDataDeliverySupported {
-        photoOutput.isDepthDataDeliveryEnabled = photo.enableDepthData
+        // Always enable depth data delivery on the output if supported
+        // Individual photos can choose whether to use it via photoSettings
+        photoOutput.isDepthDataDeliveryEnabled = true
       }
       if photoOutput.isPortraitEffectsMatteDeliverySupported {
         photoOutput.isPortraitEffectsMatteDeliveryEnabled = photo.enablePortraitEffectsMatte
@@ -116,7 +119,9 @@ extension CameraSession {
         if videoOutput.orientation.isLandscape {
           // 2.2. If we have a landscape orientation, we need to flip it to counter the mirroring on the wrong axis.
           videoOutput.orientation = videoOutput.orientation.flipped()
-          VisionLogger.log(level: .info, message: "AVCaptureVideoDataOutput will rotate Frames to \(videoOutput.orientation)...")
+          VisionLogger.log(
+            level: .info,
+            message: "AVCaptureVideoDataOutput will rotate Frames to \(videoOutput.orientation)...")
         }
       }
 
@@ -124,7 +129,7 @@ extension CameraSession {
     }
 
     // Code Scanner
-    if case let .enabled(codeScanner) = configuration.codeScanner {
+    if case .enabled(let codeScanner) = configuration.codeScanner {
       VisionLogger.log(level: .info, message: "Adding Code Scanner output...")
       let codeScannerOutput = AVCaptureMetadataOutput()
 
@@ -168,7 +173,8 @@ extension CameraSession {
     for output in captureSession.outputs {
       for connection in output.connections {
         if connection.isVideoStabilizationSupported {
-          connection.preferredVideoStabilizationMode = configuration.videoStabilizationMode.toAVCaptureVideoStabilizationMode()
+          connection.preferredVideoStabilizationMode = configuration.videoStabilizationMode
+            .toAVCaptureVideoStabilizationMode()
         }
       }
     }
@@ -189,7 +195,8 @@ extension CameraSession {
 
     let currentFormat = CameraDeviceFormat(fromFormat: device.activeFormat)
     if currentFormat == targetFormat {
-      VisionLogger.log(level: .info, message: "Already selected active format, no need to configure.")
+      VisionLogger.log(
+        level: .info, message: "Already selected active format, no need to configure.")
       return
     }
 
@@ -206,8 +213,9 @@ extension CameraSession {
   }
 
   func configureVideoOutputFormat(configuration: CameraConfiguration) {
-    guard case let .enabled(video) = configuration.video,
-          let videoOutput else {
+    guard case .enabled(let video) = configuration.video,
+      let videoOutput
+    else {
       // Video is not enabled
       return
     }
@@ -217,7 +225,7 @@ extension CameraSession {
       // We need to run this after device.activeFormat has been set, otherwise the VideoOutput can't stream the given Pixel Format.
       let pixelFormatType = try video.getPixelFormat(for: videoOutput)
       videoOutput.videoSettings = [
-        String(kCVPixelBufferPixelFormatTypeKey): pixelFormatType,
+        String(kCVPixelBufferPixelFormatTypeKey): pixelFormatType
       ]
     } catch {
       // Catch the error and send to JS as a soft-exception.
@@ -250,7 +258,8 @@ extension CameraSession {
   func configureSideProps(configuration: CameraConfiguration, device: AVCaptureDevice) throws {
     // Configure FPS
     if let minFps = configuration.minFps,
-       let maxFps = configuration.maxFps {
+      let maxFps = configuration.maxFps
+    {
       let fpsRanges = device.activeFormat.videoSupportedFrameRateRanges
       if !fpsRanges.contains(where: { $0.minFrameRate <= Double(minFps) }) {
         throw CameraError.format(.invalidFps(fps: Int(minFps)))
@@ -318,7 +327,8 @@ extension CameraSession {
       return
     }
 
-    let clamped = max(min(zoom, device.activeFormat.videoMaxZoomFactor), device.minAvailableVideoZoomFactor)
+    let clamped = max(
+      min(zoom, device.activeFormat.videoMaxZoomFactor), device.minAvailableVideoZoomFactor)
     device.videoZoomFactor = clamped
   }
 

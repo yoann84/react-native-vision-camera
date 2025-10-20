@@ -20,6 +20,16 @@ export interface DeviceFilter {
    * ```
    */
   physicalDevices?: PhysicalCameraDeviceType[]
+  /**
+   * Whether the camera device should support depth data capture (TrueDepth, LiDAR, etc.)
+   *
+   * @example
+   * ```ts
+   * // Find a front camera that supports depth capture (TrueDepth)
+   * getCameraDevice({ supportsDepthCapture: true })
+   * ```
+   */
+  supportsDepthCapture?: boolean
 }
 
 /**
@@ -49,6 +59,16 @@ export function getCameraDevice(devices: CameraDevice[], position: CameraPositio
     // prefer higher hardware-level
     if (bestDevice.hardwareLevel === 'full') leftPoints += 4
     if (device.hardwareLevel === 'full') rightPoints += 4
+
+    // Check depth capture support filter
+    if (filter.supportsDepthCapture === true) {
+      // Prefer devices that support depth capture
+      const bestDeviceSupportsDepth = bestDevice.formats.some((f) => f.supportsDepthCapture)
+      const deviceSupportsDepth = device.formats.some((f) => f.supportsDepthCapture)
+
+      if (bestDeviceSupportsDepth) leftPoints += 10
+      if (deviceSupportsDepth) rightPoints += 10
+    }
 
     if (filter.physicalDevices != null) {
       // user did pass a physical device filter, two possible scenarios:

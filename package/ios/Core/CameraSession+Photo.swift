@@ -30,7 +30,8 @@ extension CameraSession {
 
       // Check if Photo Output is available
       guard let photoOutput = self.photoOutput,
-            let videoDeviceInput = self.videoDeviceInput else {
+        let videoDeviceInput = self.videoDeviceInput
+      else {
         // Camera is not yet ready
         promise.reject(error: .session(.cameraNotReady))
         return
@@ -49,9 +50,11 @@ extension CameraSession {
       }
 
       // depth data
-      photoSettings.isDepthDataDeliveryEnabled = photoOutput.isDepthDataDeliveryEnabled
+      let shouldEnableDepthData = options.enableDepthData && photoOutput.isDepthDataDeliveryEnabled
+      photoSettings.isDepthDataDeliveryEnabled = shouldEnableDepthData
       if #available(iOS 12.0, *) {
-        photoSettings.isPortraitEffectsMatteDeliveryEnabled = photoOutput.isPortraitEffectsMatteDeliveryEnabled
+        photoSettings.isPortraitEffectsMatteDeliveryEnabled =
+          photoOutput.isPortraitEffectsMatteDeliveryEnabled
       }
 
       // quality prioritization
@@ -64,7 +67,8 @@ extension CameraSession {
 
       // distortion correction
       if #available(iOS 14.1, *) {
-        photoSettings.isAutoContentAwareDistortionCorrectionEnabled = options.enableAutoDistortionCorrection
+        photoSettings.isAutoContentAwareDistortionCorrectionEnabled =
+          options.enableAutoDistortionCorrection
       }
 
       // flash
@@ -80,11 +84,14 @@ extension CameraSession {
       }
 
       // Actually do the capture!
-      let photoCaptureDelegate = PhotoCaptureDelegate(promise: promise,
-                                                      enableShutterSound: options.enableShutterSound,
-                                                      metadataProvider: self.metadataProvider,
-                                                      path: options.path,
-                                                      cameraSessionDelegate: self.delegate)
+      let photoCaptureDelegate = PhotoCaptureDelegate(
+        promise: promise,
+        enableShutterSound: options.enableShutterSound,
+        metadataProvider: self.metadataProvider,
+        path: options.path,
+        enableDepthData: options.enableDepthData,
+        enableDebug: options.enableDebug,
+        cameraSessionDelegate: self.delegate)
       photoOutput.capturePhoto(with: photoSettings, delegate: photoCaptureDelegate)
 
       // Assume that `takePhoto` is always called with the same parameters, so prepare the next call too.

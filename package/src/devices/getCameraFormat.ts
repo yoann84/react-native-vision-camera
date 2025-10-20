@@ -74,6 +74,11 @@ export interface FormatFilter {
    * you might want to choose a different auto-focus system.
    */
   autoFocusSystem?: AutoFocusSystem
+  /**
+   * Whether you want to find a format that supports depth data capture.
+   * This is useful for TrueDepth cameras and dual-camera setups that can capture depth information.
+   */
+  supportsDepthCapture?: boolean
 }
 
 type FilterWithPriority<T> = {
@@ -112,7 +117,8 @@ function filtersToFilterMap(filters: FormatFilter[]): FilterMap {
  * ```ts
  * const format = getCameraFormat(device, [
  *   { videoResolution: { width: 3048, height: 2160 } },
- *   { fps: 60 }
+ *   { fps: 60 },
+ *   { supportsDepthCapture: true }
  * ])
  * ```
  */
@@ -234,6 +240,12 @@ export function getCameraFormat(device: CameraDevice, filters: FormatFilter[]): 
     if (filter.autoFocusSystem != null) {
       if (bestFormat.autoFocusSystem === filter.autoFocusSystem.target) leftPoints += filter.autoFocusSystem.priority
       if (format.autoFocusSystem === filter.autoFocusSystem.target) rightPoints += filter.autoFocusSystem.priority
+    }
+
+    // Find depth capture support
+    if (filter.supportsDepthCapture != null) {
+      if (bestFormat.supportsDepthCapture === filter.supportsDepthCapture.target) leftPoints += filter.supportsDepthCapture.priority
+      if (format.supportsDepthCapture === filter.supportsDepthCapture.target) rightPoints += filter.supportsDepthCapture.priority
     }
 
     if (rightPoints > leftPoints) bestFormat = format

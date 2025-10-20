@@ -14,6 +14,11 @@ import { useCameraDevices } from './useCameraDevices'
  * const device = useCameraDevice('back', {
  *    physicalDevices: ['wide-angle-camera']
  * })
+ *
+ * // Find a front camera that supports depth capture (TrueDepth)
+ * const depthDevice = useCameraDevice('front', {
+ *    supportsDepthCapture: true
+ * })
  * ```
  */
 export function useCameraDevice(position: CameraPosition, filter?: DeviceFilter): CameraDevice | undefined {
