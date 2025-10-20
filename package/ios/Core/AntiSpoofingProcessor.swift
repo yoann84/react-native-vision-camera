@@ -528,6 +528,19 @@ class AntiSpoofingProcessor {
       )
     }
 
+    // Store metrics for result (only in debug mode)
+    if enableDebug {
+      lastMetrics = [
+        "range": metrics.depthRange,
+        "stdDeviation": metrics.stdDeviation,
+        "gradient": metrics.depthGradient,
+        "smoothness": metrics.smoothness,
+        "validPixelPercentage": metrics.validPixelPercentage,
+        "checksPassed": passedCount,
+        "totalChecks": checks.count,
+      ]
+    }
+
     return isRealFace
   }
 
