@@ -82,7 +82,7 @@ class AntiSpoofingProcessor {
   // MARK: - Private Helpers
 
   private func hasDepthData(photo: AVCapturePhoto) -> Bool {
-    return photo.depthData != nil && photo.fileDataRepresentation() != nil
+    return photo.depthData != nil
   }
 
   private func performAntiSpoofing(

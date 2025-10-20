@@ -85,8 +85,6 @@ extension CameraSession {
         photoOutput.maxPhotoQualityPrioritization = qualityPrioritization
       }
       if photoOutput.isDepthDataDeliverySupported {
-        // Always enable depth data delivery on the output if supported
-        // Individual photos can choose whether to use it via photoSettings
         photoOutput.isDepthDataDeliveryEnabled = true
       }
       if photoOutput.isPortraitEffectsMatteDeliverySupported {
