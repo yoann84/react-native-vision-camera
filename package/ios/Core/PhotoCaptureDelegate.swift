@@ -19,9 +19,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
   private let path: URL
   private let enableDepthData: Bool
 
-  // Face processing results
-  private var lastProcessedFaceRect: CGRect?
-  private var lastProcessedImageSize: CGSize?
+  // Debug visualization
   private var lastDepthHeatmap: String?
 
   required init(
@@ -135,23 +133,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       }
     }
 
-    // Process depth data only if face cropping succeeded
-    var depthDataResult: [String: Any]?
-    if let depthData = photo.depthData,
-      let faceRect = lastProcessedFaceRect,
-      let imageSize = lastProcessedImageSize,
-      enableDepthData
-    {
-      // Face cropping succeeded, process cropped depth data
-      depthDataResult = try processCroppedDepthData(
-        depthData: depthData,
-        faceRect: faceRect,
-        imageSize: imageSize,
-        exifOrientation: cgOrientation
-      )
-    }
-    // If face cropping failed, both croppedImage and depthData will be nil
-
     promise.resolve([
       "path": path.absoluteString,
       "width": finalWidth,
@@ -162,7 +143,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       "metadata": photo.metadata,
       "thumbnail": photo.embeddedThumbnailPhotoFormat as Any,
       "croppedImage": croppedImageBase64 as Any,
-      "depthData": depthDataResult as Any,
       "debugDepthHeatmap": lastDepthHeatmap as Any,
     ])
   }
@@ -183,8 +163,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       throw CameraError.capture(.unknown(message: "Failed to create image from photo data"))
     }
 
-    // Store for depth data processing later
-    lastProcessedImageSize = image.size
     let imageSize = image.size
     // Detect single face with proper orientation and depth data for anti-spoofing
     do {
@@ -563,44 +541,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     return jpegData.base64EncodedString()
   }
 
-  private func createPixelBuffer(from cgImage: CGImage) -> CVPixelBuffer? {
-    let width = cgImage.width
-    let height = cgImage.height
-
-    var pixelBuffer: CVPixelBuffer?
-    let status = CVPixelBufferCreate(
-      kCFAllocatorDefault,
-      width,
-      height,
-      kCVPixelFormatType_32BGRA,
-      nil,
-      &pixelBuffer
-    )
-
-    guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
-      return nil
-    }
-
-    CVPixelBufferLockBaseAddress(buffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-
-    let pixelData = CVPixelBufferGetBaseAddress(buffer)
-    let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
-    let context = CGContext(
-      data: pixelData,
-      width: width,
-      height: height,
-      bitsPerComponent: 8,
-      bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-      space: rgbColorSpace,
-      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-    )
-
-    context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-    return buffer
-  }
-
   private func convertToDepthCoordinates(
     _ faceRect: CGRect,
     from imageSize: CGSize,
@@ -617,76 +557,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     )
   }
 
-  private func cropPixelBuffer(_ sourceBuffer: CVPixelBuffer, to cropRect: CGRect) throws
-    -> CVPixelBuffer
-  {
-    let cropX = Int(cropRect.origin.x)
-    let cropY = Int(cropRect.origin.y)
-    let cropWidth = Int(cropRect.width)
-    let cropHeight = Int(cropRect.height)
-
-    // Lock source buffer
-    CVPixelBufferLockBaseAddress(sourceBuffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(sourceBuffer, .readOnly) }
-
-    // Get source buffer properties
-    let sourceWidth = CVPixelBufferGetWidth(sourceBuffer)
-    let sourceHeight = CVPixelBufferGetHeight(sourceBuffer)
-    let pixelFormat = CVPixelBufferGetPixelFormatType(sourceBuffer)
-    let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(sourceBuffer)
-
-    // Validate crop bounds
-    guard cropX >= 0, cropY >= 0,
-      cropX + cropWidth <= sourceWidth,
-      cropY + cropHeight <= sourceHeight
-    else {
-      throw CameraError.capture(.unknown(message: "Crop region exceeds depth buffer bounds"))
-    }
-
-    // Create new pixel buffer
-    var croppedBuffer: CVPixelBuffer?
-    let status = CVPixelBufferCreate(
-      kCFAllocatorDefault,
-      cropWidth,
-      cropHeight,
-      pixelFormat,
-      nil,
-      &croppedBuffer
-    )
-
-    guard status == kCVReturnSuccess, let croppedBuffer = croppedBuffer else {
-      throw CameraError.capture(.unknown(message: "Failed to create cropped pixel buffer"))
-    }
-
-    // Lock destination buffer
-    CVPixelBufferLockBaseAddress(croppedBuffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(croppedBuffer, []) }
-
-    // Get buffer addresses
-    guard let sourceBaseAddress = CVPixelBufferGetBaseAddress(sourceBuffer),
-      let destBaseAddress = CVPixelBufferGetBaseAddress(croppedBuffer)
-    else {
-      throw CameraError.capture(.unknown(message: "Failed to get pixel buffer addresses"))
-    }
-
-    // Calculate bytes per pixel based on actual pixel format
-    let bytesPerPixel = getBytesPerPixel(for: pixelFormat)
-    let destBytesPerRow = CVPixelBufferGetBytesPerRow(croppedBuffer)
-
-    // Copy pixel data row by row
-    for row in 0..<cropHeight {
-      let sourceRowOffset = (cropY + row) * sourceBytesPerRow + cropX * bytesPerPixel
-      let destRowOffset = row * destBytesPerRow
-
-      let sourceRowPtr = sourceBaseAddress.advanced(by: sourceRowOffset)
-      let destRowPtr = destBaseAddress.advanced(by: destRowOffset)
-
-      memcpy(destRowPtr, sourceRowPtr, cropWidth * bytesPerPixel)
-    }
-
-    return croppedBuffer
-  }
-
+  // MARK: - Helper Functions
   private func getBytesPerPixel(for pixelFormat: OSType) -> Int {
     switch pixelFormat {
     case kCVPixelFormatType_DepthFloat16:
@@ -703,73 +574,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       return 4  // Default to 4 bytes, but this will be overridden by actual calculation
     }
   }
-
-  private func processCroppedDepthData(
-    depthData: AVDepthData,
-    faceRect: CGRect,
-    imageSize: CGSize,
-    exifOrientation: CGImagePropertyOrientation
-  ) throws -> [String: Any] {
-    // Apply orientation to depth data
-    let orientedDepthData = depthData.applyingExifOrientation(exifOrientation)
-
-    // Get depth buffer dimensions
-    let depthMap = orientedDepthData.depthDataMap
-    let depthWidth = CVPixelBufferGetWidth(depthMap)
-    let depthHeight = CVPixelBufferGetHeight(depthMap)
-    let depthSize = CGSize(width: depthWidth, height: depthHeight)
-
-    // Convert face coordinates to depth buffer coordinates
-    let depthFaceRect = convertToDepthCoordinates(
-      faceRect,
-      from: imageSize,
-      to: depthSize
-    )
-
-    // Crop depth data pixel buffer
-    let croppedPixelBuffer = try cropPixelBuffer(depthMap, to: depthFaceRect)
-
-    // Create new AVDepthData with cropped buffer
-    let croppedDepthData = try orientedDepthData.replacingDepthDataMap(with: croppedPixelBuffer)
-
-    // Convert to base64
-    return processDepthData(croppedDepthData)
-  }
-
-  private func processDepthData(_ depthData: AVDepthData) -> [String: Any] {
-    let depthDataMap = depthData.depthDataMap
-    let depthDataType = depthData.depthDataType
-
-    // Lock the pixel buffer for reading
-    CVPixelBufferLockBaseAddress(depthDataMap, .readOnly)
-    defer {
-      CVPixelBufferUnlockBaseAddress(depthDataMap, .readOnly)
-    }
-
-    // Get pixel buffer properties
-    let width = CVPixelBufferGetWidth(depthDataMap)
-    let height = CVPixelBufferGetHeight(depthDataMap)
-    let bytesPerRow = CVPixelBufferGetBytesPerRow(depthDataMap)
-
-    // Get base address of pixel data
-    guard let baseAddress = CVPixelBufferGetBaseAddress(depthDataMap) else {
-      return [:]
-    }
-
-    // Calculate total data size
-    let dataSize = height * bytesPerRow
-    let data = Data(bytes: baseAddress, count: dataSize)
-    let base64String = data.base64EncodedString()
-
-    return [
-      "data": base64String,
-      "format": depthDataType,
-      "width": width,
-      "height": height,
-      "bytesPerRow": bytesPerRow,
-    ]
-  }
-
   private func getOrientation(forExifOrientation exifOrientation: CGImagePropertyOrientation)
     -> String
   {
