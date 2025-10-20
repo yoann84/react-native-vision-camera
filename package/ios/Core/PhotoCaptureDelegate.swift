@@ -261,6 +261,14 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       let orientedDepthData = depthData.applyingExifOrientation(cgOrientation)
       print("Applied orientation \(cgOrientation.rawValue) to depth data")
 
+      // Create debug heatmap FIRST (before anti-spoofing check)
+      // This ensures we get the heatmap even if anti-spoofing fails
+      lastDepthHeatmap = createDepthHeatmap(
+        depthData: orientedDepthData,
+        faceRect: face.boundingBox,
+        imageSize: CGSize(width: cgImage.width, height: cgImage.height)
+      )
+
       let isRealFace = analyzeDepthAtFaceLocation(
         depthData: orientedDepthData,
         faceRect: face.boundingBox,
@@ -274,13 +282,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         throw CameraError.capture(
           .unknown(message: "Anti-spoofing failed - possible 2D spoofing detected"))
       }
-
-      // Create debug heatmap
-      lastDepthHeatmap = createDepthHeatmap(
-        depthData: orientedDepthData,
-        faceRect: face.boundingBox,
-        imageSize: CGSize(width: cgImage.width, height: cgImage.height)
-      )
     } else {
       print("One and unique face recognized - Standard detection (no depth data)")
     }
@@ -288,79 +289,90 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     return face
   }
 
+  // MARK: - Multi-Factor Anti-Spoofing Analysis
+
+  private struct DepthMetrics {
+    let minDepth: Float
+    let maxDepth: Float
+    let depthRange: Float
+    let stdDeviation: Float
+    let centerDepth: Float
+    let edgeDepth: Float
+    let depthGradient: Float
+    let validPixelPercentage: Float
+    let smoothness: Float
+  }
+
   private func analyzeDepthAtFaceLocation(
     depthData: AVDepthData,
     faceRect: CGRect,
     imageSize: CGSize
   ) -> Bool {
-    print("Analyzing depth data at face location for anti-spoofing")
+    print("🔍 Multi-factor anti-spoofing analysis started")
 
     // Get oriented depth map
     let depthMap = depthData.depthDataMap
     let depthWidth = CVPixelBufferGetWidth(depthMap)
     let depthHeight = CVPixelBufferGetHeight(depthMap)
 
-    print("Depth map size: \(depthWidth)x\(depthHeight)")
-    print("Image size: \(imageSize.width)x\(imageSize.height)")
-    print("Face rect (normalized): \(faceRect)")
-
-    // Convert normalized face rect to pixel coordinates in the IMAGE space
-    // Vision framework uses bottom-left origin, UIImage uses top-left origin
-    // Formula: newY = (1 - oldY - height) converts from bottom-left to top-left
+    // Convert normalized face rect to pixel coordinates
     let faceRectInImagePixels = CGRect(
       x: faceRect.origin.x * imageSize.width,
-      y: (1.0 - faceRect.origin.y - faceRect.height) * imageSize.height,  // Flip Y-axis
+      y: (1.0 - faceRect.origin.y - faceRect.height) * imageSize.height,
       width: faceRect.width * imageSize.width,
       height: faceRect.height * imageSize.height
     )
-    print("Face rect in image pixels (Y-flipped): \(faceRectInImagePixels)")
 
-    // Now scale from image pixel coordinates to depth map pixel coordinates
     let depthFaceRect = convertToDepthCoordinates(
       faceRectInImagePixels,
       from: imageSize,
       to: CGSize(width: depthWidth, height: depthHeight)
     )
 
-    print("Face rect in depth map pixels: \(depthFaceRect)")
-
     // Lock depth buffer for reading
     CVPixelBufferLockBaseAddress(depthMap, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
     guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
-      print("Failed to get depth map base address")
+      print("❌ Failed to get depth map base address")
       return false
     }
 
     let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
     let pixelFormat = CVPixelBufferGetPixelFormatType(depthMap)
-
-    // Analyze depth values in face region
-    let faceX = Int(depthFaceRect.origin.x)
-    let faceY = Int(depthFaceRect.origin.y)
-    let faceWidth = Int(depthFaceRect.width)
-    let faceHeight = Int(depthFaceRect.height)
-
-    var depthValues: [Float] = []
-
-    // Sample depth values in face region based on actual pixel format
     let bytesPerPixel = getBytesPerPixel(for: pixelFormat)
-    print("Depth format: \(pixelFormat), bytes per pixel: \(bytesPerPixel)")
 
     // Determine if we're working with disparity or depth data
     let isDisparityData =
       pixelFormat == kCVPixelFormatType_DisparityFloat16
       || pixelFormat == kCVPixelFormatType_DisparityFloat32
-    print("Data type: \(isDisparityData ? "Disparity" : "Depth")")
 
-    // Bounds check for face region
+    print("📊 Data type: \(isDisparityData ? "Disparity" : "Depth")")
+
+    // Collect depth values from face region
+    let faceX = Int(depthFaceRect.origin.x)
+    let faceY = Int(depthFaceRect.origin.y)
+    let faceWidth = Int(depthFaceRect.width)
+    let faceHeight = Int(depthFaceRect.height)
+
     let safeStartX = max(0, faceX)
     let safeStartY = max(0, faceY)
     let safeEndX = min(faceX + faceWidth, depthWidth)
     let safeEndY = min(faceY + faceHeight, depthHeight)
 
-    print("Sampling region: x=\(safeStartX)..\(safeEndX), y=\(safeStartY)..\(safeEndY)")
+    var allDepthValues: [Float] = []
+    var centerDepthValues: [Float] = []
+    var edgeDepthValues: [Float] = []
+
+    // Define center region (middle 40% of face)
+    let centerMargin = 0.3
+    let centerStartX = safeStartX + Int(Float(faceWidth) * Float(centerMargin))
+    let centerEndX = safeEndX - Int(Float(faceWidth) * Float(centerMargin))
+    let centerStartY = safeStartY + Int(Float(faceHeight) * Float(centerMargin))
+    let centerEndY = safeEndY - Int(Float(faceHeight) * Float(centerMargin))
+
+    let totalPixels = (safeEndX - safeStartX) * (safeEndY - safeStartY)
+    var validPixelCount = 0
 
     for y in safeStartY..<safeEndY {
       for x in safeStartX..<safeEndX {
@@ -369,63 +381,198 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         let depthValue: Float
         switch pixelFormat {
         case kCVPixelFormatType_DepthFloat16:
-          let float16Value = baseAddress.load(fromByteOffset: pixelOffset, as: Float16.self)
-          depthValue = Float(float16Value)
+          depthValue = Float(baseAddress.load(fromByteOffset: pixelOffset, as: Float16.self))
         case kCVPixelFormatType_DepthFloat32:
           depthValue = baseAddress.load(fromByteOffset: pixelOffset, as: Float.self)
         case kCVPixelFormatType_DisparityFloat16:
-          let float16Value = baseAddress.load(fromByteOffset: pixelOffset, as: Float16.self)
-          depthValue = Float(float16Value)
+          depthValue = Float(baseAddress.load(fromByteOffset: pixelOffset, as: Float16.self))
         case kCVPixelFormatType_DisparityFloat32:
           depthValue = baseAddress.load(fromByteOffset: pixelOffset, as: Float.self)
         default:
-          print("Unsupported depth format: \(pixelFormat)")
           continue
         }
 
         // Filter valid depth/disparity values
-        // Disparity: typically 0-2 (higher = closer)
-        // Depth: typically 0-10 meters (higher = farther)
         let isValidValue: Bool
         if isDisparityData {
-          // For disparity, valid values are typically 0.0 to 2.0
           isValidValue = depthValue > 0 && depthValue < 5.0
         } else {
-          // For depth, valid values are typically 0.0 to 10.0 meters
           isValidValue = depthValue > 0 && depthValue < 10.0
         }
 
         if isValidValue {
-          depthValues.append(depthValue)
+          validPixelCount += 1
+          allDepthValues.append(depthValue)
+
+          // Categorize as center or edge
+          if x >= centerStartX && x < centerEndX && y >= centerStartY && y < centerEndY {
+            centerDepthValues.append(depthValue)
+          } else {
+            edgeDepthValues.append(depthValue)
+          }
         }
       }
     }
 
-    print("Collected \(depthValues.count) valid depth values")
-
-    // Analyze depth variation
-    guard !depthValues.isEmpty else {
-      print("No depth values found in face region")
+    guard !allDepthValues.isEmpty else {
+      print("❌ No valid depth values found")
       return false
     }
 
-    let minDepth = depthValues.min() ?? 0
-    let maxDepth = depthValues.max() ?? 0
-    let depthRange = maxDepth - minDepth
-    let avgDepth = depthValues.reduce(0, +) / Float(depthValues.count)
-
-    print(
-      "Depth analysis - Min: \(minDepth), Max: \(maxDepth), Range: \(depthRange), Avg: \(avgDepth), Count: \(depthValues.count)"
+    // Calculate comprehensive metrics
+    let metrics = calculateDepthMetrics(
+      allValues: allDepthValues,
+      centerValues: centerDepthValues,
+      edgeValues: edgeDepthValues,
+      validPixelCount: validPixelCount,
+      totalPixelCount: totalPixels
     )
 
-    // Anti-spoofing logic: Real faces should have significant depth variation
-    // 2D screens/photos will have minimal depth variation
-    // For disparity data, variation is typically smaller than depth data
-    let minDepthVariation: Float = isDisparityData ? 0.05 : 0.1
-    let isRealFace = depthRange > minDepthVariation
+    // Multi-factor anti-spoofing checks
+    let result = performMultiFactorAntiSpoofing(metrics: metrics, isDisparityData: isDisparityData)
+
+    return result
+  }
+
+  private func calculateDepthMetrics(
+    allValues: [Float],
+    centerValues: [Float],
+    edgeValues: [Float],
+    validPixelCount: Int,
+    totalPixelCount: Int
+  ) -> DepthMetrics {
+    let minDepth = allValues.min() ?? 0
+    let maxDepth = allValues.max() ?? 0
+    let depthRange = maxDepth - minDepth
+    let avgDepth = allValues.reduce(0, +) / Float(allValues.count)
+
+    // Calculate standard deviation
+    let variance = allValues.map { pow($0 - avgDepth, 2) }.reduce(0, +) / Float(allValues.count)
+    let stdDeviation = sqrt(variance)
+
+    // Calculate center vs edge depth (for concentric pattern detection)
+    let centerDepth =
+      centerValues.isEmpty ? 0 : centerValues.reduce(0, +) / Float(centerValues.count)
+    let edgeDepth = edgeValues.isEmpty ? 0 : edgeValues.reduce(0, +) / Float(edgeValues.count)
+    let depthGradient = abs(centerDepth - edgeDepth)
+
+    // Calculate valid pixel percentage
+    let validPixelPercentage = Float(validPixelCount) / Float(totalPixelCount)
+
+    // Calculate smoothness (average absolute difference between adjacent values)
+    var gradients: [Float] = []
+    for i in 1..<allValues.count {
+      gradients.append(abs(allValues[i] - allValues[i - 1]))
+    }
+    let smoothness = gradients.isEmpty ? 0 : gradients.reduce(0, +) / Float(gradients.count)
+
+    return DepthMetrics(
+      minDepth: minDepth,
+      maxDepth: maxDepth,
+      depthRange: depthRange,
+      stdDeviation: stdDeviation,
+      centerDepth: centerDepth,
+      edgeDepth: edgeDepth,
+      depthGradient: depthGradient,
+      validPixelPercentage: validPixelPercentage,
+      smoothness: smoothness
+    )
+  }
+
+  private func performMultiFactorAntiSpoofing(metrics: DepthMetrics, isDisparityData: Bool) -> Bool
+  {
+    print("\n📊 DEPTH METRICS:")
+    print("  Range: \(metrics.depthRange)")
+    print("  Std Dev: \(metrics.stdDeviation)")
+    print("  Center→Edge Gradient: \(metrics.depthGradient)")
+    print("  Smoothness: \(metrics.smoothness)")
+    print("  Valid Pixels: \(String(format: "%.1f%%", metrics.validPixelPercentage * 100))")
+    print("  Data type: \(isDisparityData ? "Disparity" : "Depth")")
+
+    // Define thresholds based on research and data type
+    // Research-based thresholds for real faces:
+    // - Depth range: >80-100mm (0.08-0.10m) for depth, >0.15 for disparity
+    // - Std deviation: >30mm (0.03m) for depth, >0.05 for disparity
+    // - Center-edge gradient: >50mm (0.05m) for depth, >0.08 for disparity
+    // - Smoothness: 0.01-0.04 (too low = uniform/fake, too high = noisy)
+    // - Valid pixels: >85%
+
+    let thresholds:
+      (
+        range: Float, stdDev: Float, gradient: Float, minSmoothness: Float, maxSmoothness: Float,
+        validPixels: Float
+      )
+
+    if isDisparityData {
+      // Disparity thresholds (higher values = closer objects)
+      // Updated based on real-world testing:
+      // Session 1 - Real: range=2.82, stdDev=0.73, gradient=0.54 (close)
+      // Session 2 - Real: range=1.19, stdDev=0.24, gradient=0.13 (normal distance)
+      // Session 1 - Fake: range=0.39, stdDev=0.10, gradient=0.11
+      // Session 2 - Fake: range=0.12, stdDev=0.022, gradient=0.006
+      thresholds = (
+        range: 0.50,  // Real: 1.19-2.82, Fake: 0.12-0.39 → Clear separation ✅
+        stdDev: 0.15,  // Real: 0.24-0.73, Fake: 0.022-0.10 → Clear separation ✅
+        gradient: 0.10,  // Real: 0.13-0.54, Fake: 0.006-0.11 → Adjusted for distance ⚠️
+        minSmoothness: 0.005,  // Fake session 2 had 0.002 → Caught it! ✅
+        maxSmoothness: 0.06,  // Not too noisy
+        validPixels: 0.85  // Not reliable (fake had 100%) → Use as backup only
+      )
+    } else {
+      // Depth thresholds (meters)
+      thresholds = (
+        range: 0.10,  // Minimum 100mm (10cm) depth variation
+        stdDev: 0.03,  // Minimum 30mm standard deviation
+        gradient: 0.05,  // Minimum 50mm center-to-edge difference
+        minSmoothness: 0.005,  // Not too uniform
+        maxSmoothness: 0.04,  // Not too noisy
+        validPixels: 0.85  // At least 85% valid pixels
+      )
+    }
+
+    // Perform individual checks
+    let check1_range = metrics.depthRange > thresholds.range
+    let check2_stdDev = metrics.stdDeviation > thresholds.stdDev
+    let check3_gradient = metrics.depthGradient > thresholds.gradient
+    let check4_smoothness =
+      metrics.smoothness > thresholds.minSmoothness && metrics.smoothness < thresholds.maxSmoothness
+    let check5_validPixels = metrics.validPixelPercentage > thresholds.validPixels
+
+    print("\n📋 THRESHOLDS (min required):")
+    print("  Range: \(thresholds.range)")
+    print("  Std Dev: \(thresholds.stdDev)")
+    print("  Gradient: \(thresholds.gradient)")
+    print("  Smoothness: \(thresholds.minSmoothness)-\(thresholds.maxSmoothness)")
+    print("  Valid Pixels: \(String(format: "%.0f%%", thresholds.validPixels * 100))")
+
+    print("\n✅ ANTI-SPOOFING CHECKS:")
+    print(
+      "  1. Depth Range (\(metrics.depthRange) > \(thresholds.range)): \(check1_range ? "✓ PASS" : "✗ FAIL")"
+    )
+    print(
+      "  2. Std Deviation (\(metrics.stdDeviation) > \(thresholds.stdDev)): \(check2_stdDev ? "✓ PASS" : "✗ FAIL")"
+    )
+    print(
+      "  3. Center→Edge Gradient (\(metrics.depthGradient) > \(thresholds.gradient)): \(check3_gradient ? "✓ PASS" : "✗ FAIL")"
+    )
+    print(
+      "  4. Smoothness (\(thresholds.minSmoothness) < \(metrics.smoothness) < \(thresholds.maxSmoothness)): \(check4_smoothness ? "✓ PASS" : "✗ FAIL")"
+    )
+    print(
+      "  5. Valid Pixel Coverage (\(String(format: "%.1f%%", metrics.validPixelPercentage * 100)) > \(String(format: "%.0f%%", thresholds.validPixels * 100))): \(check5_validPixels ? "✓ PASS" : "✗ FAIL")"
+    )
+
+    // Count passed checks
+    let checks = [
+      check1_range, check2_stdDev, check3_gradient, check4_smoothness, check5_validPixels,
+    ]
+    let passedCount = checks.filter { $0 }.count
+
+    // Require at least 4 out of 5 checks to pass for real face
+    let isRealFace = passedCount >= 4
 
     print(
-      "Anti-spoofing result: \(isRealFace ? "Real face" : "Possible spoofing") - Depth range: \(depthRange) (threshold: \(minDepthVariation))"
+      "\n🎯 RESULT: \(passedCount)/5 checks passed → \(isRealFace ? "✅ REAL FACE" : "❌ SPOOFING DETECTED")\n"
     )
 
     return isRealFace
