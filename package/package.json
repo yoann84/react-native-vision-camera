@@ -33,6 +33,7 @@
     "lint-ci": "eslint \"**/*.{js,ts,tsx}\" -f @jamesacarr/github-actions",
     "start": "cd example && bun start",
     "build": "bob build",
+    "prepare": "bob build",
     "release": "bob build && release-it",
     "pods": "cd example && bun pods",
     "bootstrap": "bun && cd example && bun && bun pods",
