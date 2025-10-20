@@ -52,6 +52,20 @@ export interface TakePhotoOptions {
    * @default false
    */
   enableDepthData?: boolean
+
+  /**
+   * Enable debug mode for depth-based anti-spoofing.
+   *
+   * When enabled:
+   * - Logs detailed anti-spoofing metrics to console
+   * - Generates a debug depth heatmap visualization
+   *
+   * Only works when `enableDepthData` is also true.
+   *
+   * @platform iOS
+   * @default false
+   */
+  enableDebug?: boolean
 }
 
 /**
@@ -166,44 +180,14 @@ export interface PhotoFile extends TemporaryFile {
     }
   }
   /**
-   * Base64-encoded cropped face image, if face detection was enabled and successful.
+   * Anti-spoofing result from depth-based face analysis.
    *
-   * Only present when enableDepthData is true and exactly one face is detected.
-   *
-   * @platform iOS
-   */
-  croppedImage?: string
-  /**
-   * Depth data captured along with the photo, if available.
-   *
-   * Contains distance information for each pixel in the image,
-   * useful for anti-spoofing detection and 3D applications.
+   * Contains the result of TrueDepth anti-spoofing checks.
+   * Only present when `enableDepthData` is true.
    *
    * @platform iOS
    */
-  depthData?: {
-    /**
-     * Base64-encoded depth map data
-     */
-    data: string
-    /**
-     * Depth data format identifier
-     * Common values: kCVPixelFormatType_DisparityFloat32, kCVPixelFormatType_DepthFloat32
-     */
-    format: number
-    /**
-     * Width of the depth map in pixels
-     */
-    width: number
-    /**
-     * Height of the depth map in pixels
-     */
-    height: number
-    /**
-     * Bytes per row in the depth map
-     */
-    bytesPerRow: number
-  }
+  antiSpoofing?: AntiSpoofingResult
   /**
    * Debug depth heatmap showing depth values as colors.
    *
@@ -212,9 +196,103 @@ export interface PhotoFile extends TemporaryFile {
    * - Green/Yellow: Medium distance
    * - Red: Close (high depth/disparity)
    *
-   * Only present when enableDepthData is true and face detection succeeds.
+   * Only present when `enableDepthData` and `enableDebug` are both true.
    *
    * @platform iOS
    */
   debugDepthHeatmap?: string
+}
+
+/**
+ * Result of TrueDepth-based anti-spoofing analysis.
+ */
+export interface AntiSpoofingResult {
+  /**
+   * Whether TrueDepth anti-spoofing was enabled for this capture.
+   */
+  isEnabled: boolean
+
+  /**
+   * Whether the device has TrueDepth capability (depth sensor available).
+   */
+  hasTrueDepth: boolean
+
+  /**
+   * Whether exactly one face was detected in the image.
+   */
+  faceDetected: boolean
+
+  /**
+   * Number of faces detected (0, 1, or multiple).
+   */
+  faceCount: number
+
+  /**
+   * Whether the detected face passed anti-spoofing checks.
+   * Only meaningful when `faceDetected` is true.
+   */
+  isRealFace: boolean
+
+  /**
+   * Human-readable status of the anti-spoofing check.
+   *
+   * Possible values:
+   * - `"success"` - One real face detected, anti-spoofing passed
+   * - `"no_face"` - No face detected in the image
+   * - `"multiple_faces"` - Multiple faces detected (requires exactly one)
+   * - `"spoofing_detected"` - Face detected but failed anti-spoofing checks (fake face, photo, screen)
+   * - `"no_depth_data"` - Device doesn't support depth capture
+   * - `"disabled"` - Anti-spoofing not enabled
+   */
+  status: 'success' | 'no_face' | 'multiple_faces' | 'spoofing_detected' | 'no_depth_data' | 'disabled'
+
+  /**
+   * Detailed error or status message.
+   */
+  message: string
+
+  /**
+   * Detailed metrics from the anti-spoofing analysis (only when debug mode is enabled).
+   */
+  metrics?: {
+    /**
+     * Depth range (max - min) in the face region.
+     * Higher values indicate more 3D variation (real face).
+     */
+    range: number
+
+    /**
+     * Standard deviation of depth values.
+     * Higher values indicate more depth variation (real face).
+     */
+    stdDeviation: number
+
+    /**
+     * Depth gradient from face center (nose) to edges.
+     * Higher values indicate nose protrusion (real face).
+     */
+    gradient: number
+
+    /**
+     * Smoothness of depth transitions.
+     * Values in range indicate natural face contours.
+     */
+    smoothness: number
+
+    /**
+     * Percentage of pixels with valid depth readings.
+     * Higher percentages indicate better sensor lock.
+     */
+    validPixelPercentage: number
+
+    /**
+     * Number of anti-spoofing checks passed (out of 5).
+     */
+    checksPassed: number
+
+    /**
+     * Total number of checks performed.
+     */
+    totalChecks: number
+  }
 }

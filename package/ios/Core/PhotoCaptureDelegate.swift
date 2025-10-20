@@ -18,9 +18,13 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
   private let metadataProvider: MetadataProvider
   private let path: URL
   private let enableDepthData: Bool
+  private let enableDebug: Bool
 
   // Debug visualization
   private var lastDepthHeatmap: String?
+
+  // Anti-spoofing result
+  private var antiSpoofingResult: [String: Any]?
 
   required init(
     promise: Promise,
@@ -28,6 +32,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     metadataProvider: MetadataProvider,
     path: URL,
     enableDepthData: Bool,
+    enableDebug: Bool,
     cameraSessionDelegate: CameraSessionDelegate?
   ) {
     self.promise = promise
@@ -35,6 +40,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     self.metadataProvider = metadataProvider
     self.path = path
     self.enableDepthData = enableDepthData
+    self.enableDebug = enableDebug
     self.cameraSessionDelegate = cameraSessionDelegate
     super.init()
     makeGlobal()
@@ -116,21 +122,62 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     let orientation = getOrientation(forExifOrientation: cgOrientation)
     let isMirrored = getIsMirrored(forExifOrientation: cgOrientation)
 
-    // Process face detection and anti-spoofing (no cropping)
-    var croppedImageBase64: String?
-    var finalWidth: Any = exif?["PixelXDimension"] as Any
-    var finalHeight: Any = exif?["PixelYDimension"] as Any
+    // Process face detection and anti-spoofing
+    let finalWidth: Any = exif?["PixelXDimension"] as Any
+    let finalHeight: Any = exif?["PixelYDimension"] as Any
 
-    if shouldProcessTrueDepth(photo: photo) {
-      do {
-        let result = try processAntiSpoofing(photo: photo, exifOrientation: exifOrientation)
-      } catch {
-        // Face detection failed, continue with regular processing
-        print("Face detection failed: \(error.localizedDescription)")
+    // Initialize anti-spoofing result
+    if enableDepthData {
+      if shouldProcessTrueDepth(photo: photo) {
+        do {
+          antiSpoofingResult = try processAntiSpoofing(
+            photo: photo, exifOrientation: exifOrientation)
+        } catch {
+          // Face detection failed, build error result
+          if enableDebug {
+            print("Face detection failed: \(error.localizedDescription)")
+          }
+
+          // Determine status based on error and face count
+          let status: String
+          if lastFaceCount == 0 {
+            status = "no_face"
+          } else if lastFaceCount > 1 {
+            status = "multiple_faces"
+          } else {
+            status = "spoofing_detected"
+          }
+
+          antiSpoofingResult = buildAntiSpoofingResult(
+            isEnabled: true,
+            hasTrueDepth: true,
+            faceCount: lastFaceCount,
+            status: status,
+            message: error.localizedDescription
+          )
+        }
+      } else {
+        // No depth data available
+        antiSpoofingResult = buildAntiSpoofingResult(
+          isEnabled: true,
+          hasTrueDepth: false,
+          faceCount: 0,
+          status: "no_depth_data",
+          message: "Device does not support depth capture"
+        )
       }
+    } else {
+      // Anti-spoofing disabled
+      antiSpoofingResult = buildAntiSpoofingResult(
+        isEnabled: false,
+        hasTrueDepth: false,
+        faceCount: 0,
+        status: "disabled",
+        message: "Anti-spoofing not enabled"
+      )
     }
 
-    promise.resolve([
+    var result: [String: Any] = [
       "path": path.absoluteString,
       "width": finalWidth,
       "height": finalHeight,
@@ -139,20 +186,28 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       "isRawPhoto": photo.isRawPhoto,
       "metadata": photo.metadata,
       "thumbnail": photo.embeddedThumbnailPhotoFormat as Any,
-      "croppedImage": croppedImageBase64 as Any,
-      "debugDepthHeatmap": lastDepthHeatmap as Any,
-    ])
+    ]
+
+    // Add anti-spoofing result
+    if let antiSpoofing = antiSpoofingResult {
+      result["antiSpoofing"] = antiSpoofing
+    }
+
+    // Add debug heatmap only if debug mode is enabled
+    if enableDebug, let heatmap = lastDepthHeatmap {
+      result["debugDepthHeatmap"] = heatmap
+    }
+
+    promise.resolve(result)
   }
 
-  private struct AntiSpoofingResult {
-    let isTrueFace: Bool
-    let reason: String
-  }
+  private var lastMetrics: [String: Any]?
+  private var lastFaceCount: Int = 0
 
   private func processAntiSpoofing(
     photo: AVCapturePhoto,
     exifOrientation: UInt32
-  ) throws -> AntiSpoofingResult {
+  ) throws -> [String: Any] {
     // Extract image and metadata
     guard let imageData = photo.fileDataRepresentation(),
       let image = UIImage(data: imageData)
@@ -167,24 +222,46 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         in: image, photo: photo, exifOrientation: exifOrientation
       )
 
-      // Essential debug info
-      print("Face bounding box: \(faceObservation.boundingBox)")
-      print("Image size: \(imageSize)")
+      lastFaceCount = 1
 
       // Anti-spoofing passed - one unique face detected
-      return AntiSpoofingResult(
-        isTrueFace: true,
-        reason: "One and unique face recognized"
+      return buildAntiSpoofingResult(
+        isEnabled: true,
+        hasTrueDepth: true,
+        faceCount: 1,
+        isRealFace: true,
+        status: "success",
+        message: "One and unique face recognized"
       )
     } catch {
-      // Handle no face detected case
-      print("No face recognized")
-
-      return AntiSpoofingResult(
-        isTrueFace: false,
-        reason: "No face detected"
-      )
+      throw error
     }
+  }
+
+  private func buildAntiSpoofingResult(
+    isEnabled: Bool,
+    hasTrueDepth: Bool,
+    faceCount: Int,
+    isRealFace: Bool = false,
+    status: String,
+    message: String
+  ) -> [String: Any] {
+    var result: [String: Any] = [
+      "isEnabled": isEnabled,
+      "hasTrueDepth": hasTrueDepth,
+      "faceDetected": faceCount == 1,
+      "faceCount": faceCount,
+      "isRealFace": isRealFace,
+      "status": status,
+      "message": message,
+    ]
+
+    // Add metrics only if debug mode is enabled and we have metrics
+    if enableDebug, let metrics = lastMetrics {
+      result["metrics"] = metrics
+    }
+
+    return result
   }
 
   private func detectSingleFace(in image: UIImage, photo: AVCapturePhoto, exifOrientation: UInt32)
@@ -205,13 +282,15 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       if let error = error {
         detectionError = error
       } else if let results = request.results as? [VNFaceObservation] {
+        self.lastFaceCount = results.count
+
         if results.count == 1 {
           detectedFace = results.first
         } else if results.isEmpty {
           detectionError = CameraError.capture(.unknown(message: "No face detected in image"))
         } else {
           detectionError = CameraError.capture(
-            .unknown(message: "Multiple faces detected, unable to crop"))
+            .unknown(message: "Multiple faces detected (\(results.count) faces found)"))
         }
       }
       semaphore.signal()
@@ -258,8 +337,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         imageSize: CGSize(width: cgImage.width, height: cgImage.height)
       )
 
-      if isRealFace {
-      } else {
+      if !isRealFace {
         throw CameraError.capture(
           .unknown(message: "Anti-spoofing failed - possible 2D spoofing detected"))
       }
@@ -326,8 +404,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       pixelFormat == kCVPixelFormatType_DisparityFloat16
       || pixelFormat == kCVPixelFormatType_DisparityFloat32
 
-    print("📊 Data type: \(isDisparityData ? "Disparity" : "Depth")")
-
     // Collect depth values from face region
     let faceX = Int(depthFaceRect.origin.x)
     let faceY = Int(depthFaceRect.origin.y)
@@ -361,7 +437,9 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         y: faceRect.origin.y + avgY * faceRect.height
       )
 
-      print("👃 Using actual nose landmarks for center detection")
+      if enableDebug {
+        print("👃 Using actual nose landmarks for center detection")
+      }
     }
 
     // Define center region based on nose position or geometric center
@@ -389,9 +467,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       centerStartY = max(safeStartY, Int(noseInDepth.y) - radiusY)
       centerEndY = min(safeEndY, Int(noseInDepth.y) + radiusY)
 
-      print(
-        "  Center region: Nose-based (\(centerStartX)-\(centerEndX), \(centerStartY)-\(centerEndY))"
-      )
     } else {
       // Fallback to geometric center (60% center region for better coverage)
       let centerMargin = 0.2  // 60% center (was 40%)
@@ -400,9 +475,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       centerStartY = safeStartY + Int(Float(faceHeight) * Float(centerMargin))
       centerEndY = safeEndY - Int(Float(faceHeight) * Float(centerMargin))
 
-      print(
-        "  Center region: Geometric fallback (\(centerStartX)-\(centerEndX), \(centerStartY)-\(centerEndY))"
-      )
     }
 
     let totalPixels = (safeEndX - safeStartX) * (safeEndY - safeStartY)
@@ -515,13 +587,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
   private func performMultiFactorAntiSpoofing(metrics: DepthMetrics, isDisparityData: Bool) -> Bool
   {
-    print("\n📊 DEPTH METRICS:")
-    print("  Range: \(metrics.depthRange)")
-    print("  Std Dev: \(metrics.stdDeviation)")
-    print("  Center→Edge Gradient: \(metrics.depthGradient)")
-    print("  Smoothness: \(metrics.smoothness)")
-    print("  Valid Pixels: \(String(format: "%.1f%%", metrics.validPixelPercentage * 100))")
-    print("  Data type: \(isDisparityData ? "Disparity" : "Depth")")
 
     // Define thresholds based on research and data type
     // Research-based thresholds for real faces:
@@ -572,29 +637,31 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       metrics.smoothness > thresholds.minSmoothness && metrics.smoothness < thresholds.maxSmoothness
     let check5_validPixels = metrics.validPixelPercentage > thresholds.validPixels
 
-    print("\n📋 THRESHOLDS (min required):")
-    print("  Range: \(thresholds.range)")
-    print("  Std Dev: \(thresholds.stdDev)")
-    print("  Gradient: \(thresholds.gradient)")
-    print("  Smoothness: \(thresholds.minSmoothness)-\(thresholds.maxSmoothness)")
-    print("  Valid Pixels: \(String(format: "%.0f%%", thresholds.validPixels * 100))")
+    if enableDebug {
+      print("\n📋 THRESHOLDS (min required):")
+      print("  Range: \(thresholds.range)")
+      print("  Std Dev: \(thresholds.stdDev)")
+      print("  Gradient: \(thresholds.gradient)")
+      print("  Smoothness: \(thresholds.minSmoothness)-\(thresholds.maxSmoothness)")
+      print("  Valid Pixels: \(String(format: "%.0f%%", thresholds.validPixels * 100))")
 
-    print("\n✅ ANTI-SPOOFING CHECKS:")
-    print(
-      "  1. Depth Range (\(metrics.depthRange) > \(thresholds.range)): \(check1_range ? "✓ PASS" : "✗ FAIL")"
-    )
-    print(
-      "  2. Std Deviation (\(metrics.stdDeviation) > \(thresholds.stdDev)): \(check2_stdDev ? "✓ PASS" : "✗ FAIL")"
-    )
-    print(
-      "  3. Center→Edge Gradient (\(metrics.depthGradient) > \(thresholds.gradient)): \(check3_gradient ? "✓ PASS" : "✗ FAIL")"
-    )
-    print(
-      "  4. Smoothness (\(thresholds.minSmoothness) < \(metrics.smoothness) < \(thresholds.maxSmoothness)): \(check4_smoothness ? "✓ PASS" : "✗ FAIL")"
-    )
-    print(
-      "  5. Valid Pixel Coverage (\(String(format: "%.1f%%", metrics.validPixelPercentage * 100)) > \(String(format: "%.0f%%", thresholds.validPixels * 100))): \(check5_validPixels ? "✓ PASS" : "✗ FAIL")"
-    )
+      print("\n✅ ANTI-SPOOFING CHECKS:")
+      print(
+        "  1. Depth Range (\(metrics.depthRange) > \(thresholds.range)): \(check1_range ? "✓ PASS" : "✗ FAIL")"
+      )
+      print(
+        "  2. Std Deviation (\(metrics.stdDeviation) > \(thresholds.stdDev)): \(check2_stdDev ? "✓ PASS" : "✗ FAIL")"
+      )
+      print(
+        "  3. Center→Edge Gradient (\(metrics.depthGradient) > \(thresholds.gradient)): \(check3_gradient ? "✓ PASS" : "✗ FAIL")"
+      )
+      print(
+        "  4. Smoothness (\(thresholds.minSmoothness) < \(metrics.smoothness) < \(thresholds.maxSmoothness)): \(check4_smoothness ? "✓ PASS" : "✗ FAIL")"
+      )
+      print(
+        "  5. Valid Pixel Coverage (\(String(format: "%.1f%%", metrics.validPixelPercentage * 100)) > \(String(format: "%.0f%%", thresholds.validPixels * 100))): \(check5_validPixels ? "✓ PASS" : "✗ FAIL")"
+      )
+    }
 
     // Count passed checks
     let checks = [
@@ -605,9 +672,11 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     // Require at least 4 out of 5 checks to pass for real face
     let isRealFace = passedCount >= 4
 
-    print(
-      "\n🎯 RESULT: \(passedCount)/5 checks passed → \(isRealFace ? "✅ REAL FACE" : "❌ SPOOFING DETECTED")\n"
-    )
+    if enableDebug {
+      print(
+        "\n🎯 RESULT: \(passedCount)/5 checks passed → \(isRealFace ? "✅ REAL FACE" : "❌ SPOOFING DETECTED")\n"
+      )
+    }
 
     return isRealFace
   }

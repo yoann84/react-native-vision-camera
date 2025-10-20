@@ -90,6 +90,7 @@ extension CameraSession {
         metadataProvider: self.metadataProvider,
         path: options.path,
         enableDepthData: options.enableDepthData,
+        enableDebug: options.enableDebug,
         cameraSessionDelegate: self.delegate)
       photoOutput.capturePhoto(with: photoSettings, delegate: photoCaptureDelegate)
 

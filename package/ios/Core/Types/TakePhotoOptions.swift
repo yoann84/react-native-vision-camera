@@ -15,6 +15,7 @@ struct TakePhotoOptions {
   var enableAutoDistortionCorrection = false
   var enableShutterSound = true
   var enableDepthData = false
+  var enableDebug = false
 
   init(fromJSValue dictionary: NSDictionary) throws {
     // Flash
@@ -23,6 +24,9 @@ struct TakePhotoOptions {
     }
     if let enable = dictionary["enableDepthData"] as? Bool {
       enableDepthData = enable
+    }
+    if let enable = dictionary["enableDebug"] as? Bool {
+      enableDebug = enable
     }
     // Red-Eye reduction
     if let enable = dictionary["enableAutoRedEyeReduction"] as? Bool {
