@@ -22,6 +22,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
   // Face processing results
   private var lastProcessedFaceRect: CGRect?
   private var lastProcessedImageSize: CGSize?
+  private var lastDepthHeatmap: String?
 
   required init(
     promise: Promise,
@@ -162,6 +163,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       "thumbnail": photo.embeddedThumbnailPhotoFormat as Any,
       "croppedImage": croppedImageBase64 as Any,
       "depthData": depthDataResult as Any,
+      "debugDepthHeatmap": lastDepthHeatmap as Any,
     ])
   }
 
@@ -294,6 +296,13 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
         throw CameraError.capture(
           .unknown(message: "Anti-spoofing failed - possible 2D spoofing detected"))
       }
+
+      // Create debug heatmap
+      lastDepthHeatmap = createDepthHeatmap(
+        depthData: orientedDepthData,
+        faceRect: face.boundingBox,
+        imageSize: CGSize(width: cgImage.width, height: cgImage.height)
+      )
     } else {
       print("One and unique face recognized - Standard detection (no depth data)")
     }
@@ -318,13 +327,15 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     print("Face rect (normalized): \(faceRect)")
 
     // Convert normalized face rect to pixel coordinates in the IMAGE space
+    // Vision framework uses bottom-left origin, UIImage uses top-left origin
+    // Formula: newY = (1 - oldY - height) converts from bottom-left to top-left
     let faceRectInImagePixels = CGRect(
       x: faceRect.origin.x * imageSize.width,
-      y: faceRect.origin.y * imageSize.height,
+      y: (1.0 - faceRect.origin.y - faceRect.height) * imageSize.height,  // Flip Y-axis
       width: faceRect.width * imageSize.width,
       height: faceRect.height * imageSize.height
     )
-    print("Face rect in image pixels: \(faceRectInImagePixels)")
+    print("Face rect in image pixels (Y-flipped): \(faceRectInImagePixels)")
 
     // Now scale from image pixel coordinates to depth map pixel coordinates
     let depthFaceRect = convertToDepthCoordinates(
@@ -440,6 +451,116 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     )
 
     return isRealFace
+  }
+
+  private func createDepthHeatmap(
+    depthData: AVDepthData,
+    faceRect: CGRect,
+    imageSize: CGSize
+  ) -> String? {
+    let depthMap = depthData.depthDataMap
+    let depthWidth = CVPixelBufferGetWidth(depthMap)
+    let depthHeight = CVPixelBufferGetHeight(depthMap)
+
+    // Convert face rect to depth coordinates
+    // Vision framework uses bottom-left origin, UIImage uses top-left origin
+    let faceRectInImagePixels = CGRect(
+      x: faceRect.origin.x * imageSize.width,
+      y: (1.0 - faceRect.origin.y - faceRect.height) * imageSize.height,  // Flip Y-axis
+      width: faceRect.width * imageSize.width,
+      height: faceRect.height * imageSize.height
+    )
+
+    let depthFaceRect = convertToDepthCoordinates(
+      faceRectInImagePixels,
+      from: imageSize,
+      to: CGSize(width: depthWidth, height: depthHeight)
+    )
+
+    let startX = max(0, Int(depthFaceRect.origin.x))
+    let startY = max(0, Int(depthFaceRect.origin.y))
+    let endX = min(Int(depthFaceRect.origin.x + depthFaceRect.width), depthWidth)
+    let endY = min(Int(depthFaceRect.origin.y + depthFaceRect.height), depthHeight)
+    let width = endX - startX
+    let height = endY - startY
+
+    guard width > 0 && height > 0 else { return nil }
+
+    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+    guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+
+    // Collect depth values and find min/max for normalization
+    var depthValues: [Float] = []
+    for y in startY..<endY {
+      for x in startX..<endX {
+        let offset = y * bytesPerRow + x * 2  // 2 bytes for Float16
+        let depthValue = baseAddress.load(fromByteOffset: offset, as: Float16.self)
+        if depthValue > 0 {
+          depthValues.append(Float(depthValue))
+        }
+      }
+    }
+
+    guard !depthValues.isEmpty else { return nil }
+
+    let minDepth = depthValues.min() ?? 0
+    let maxDepth = depthValues.max() ?? 1
+    let range = maxDepth - minDepth
+
+    // Create RGB image
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+
+    for y in startY..<endY {
+      for x in startX..<endX {
+        let offset = y * bytesPerRow + x * 2
+        let depthValue = Float(baseAddress.load(fromByteOffset: offset, as: Float16.self))
+
+        let normalized = range > 0 ? (depthValue - minDepth) / range : 0
+        let pixelIndex = ((y - startY) * width + (x - startX)) * 4
+
+        // Color mapping: blue (far) → green → yellow → red (close)
+        if normalized < 0.33 {
+          let t = normalized / 0.33
+          pixels[pixelIndex] = UInt8(255 * (1 - t))  // R
+          pixels[pixelIndex + 1] = 0  // G
+          pixels[pixelIndex + 2] = 255  // B
+        } else if normalized < 0.66 {
+          let t = (normalized - 0.33) / 0.33
+          pixels[pixelIndex] = UInt8(255 * t)  // R
+          pixels[pixelIndex + 1] = UInt8(255 * t)  // G
+          pixels[pixelIndex + 2] = UInt8(255 * (1 - t))  // B
+        } else {
+          let t = (normalized - 0.66) / 0.34
+          pixels[pixelIndex] = 255  // R
+          pixels[pixelIndex + 1] = UInt8(255 * (1 - t))  // G
+          pixels[pixelIndex + 2] = 0  // B
+        }
+      }
+    }
+
+    guard
+      let context = CGContext(
+        data: &pixels,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: colorSpace,
+        bitmapInfo: bitmapInfo
+      ),
+      let cgImage = context.makeImage()
+    else { return nil }
+
+    let uiImage = UIImage(cgImage: cgImage)
+    guard let jpegData = uiImage.jpegData(compressionQuality: 0.8) else { return nil }
+
+    return jpegData.base64EncodedString()
   }
 
   private func createPixelBuffer(from cgImage: CGImage) -> CVPixelBuffer? {

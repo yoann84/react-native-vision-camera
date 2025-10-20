@@ -41,13 +41,13 @@ export interface TakePhotoOptions {
 
   /**
    * Whether to capture depth data along with the photo.
-   * 
+   *
    * Depth data provides distance information for each pixel,
    * enabling features like anti-spoofing detection and 3D reconstruction.
-   * 
+   *
    * Only available on devices with depth-sensing capabilities
    * (TrueDepth, LiDAR, or dual cameras).
-   * 
+   *
    * @platform iOS
    * @default false
    */
@@ -167,18 +167,18 @@ export interface PhotoFile extends TemporaryFile {
   }
   /**
    * Base64-encoded cropped face image, if face detection was enabled and successful.
-   * 
+   *
    * Only present when enableDepthData is true and exactly one face is detected.
-   * 
+   *
    * @platform iOS
    */
   croppedImage?: string
   /**
    * Depth data captured along with the photo, if available.
-   * 
+   *
    * Contains distance information for each pixel in the image,
    * useful for anti-spoofing detection and 3D applications.
-   * 
+   *
    * @platform iOS
    */
   depthData?: {
@@ -203,5 +203,18 @@ export interface PhotoFile extends TemporaryFile {
      * Bytes per row in the depth map
      */
     bytesPerRow: number
-  } 
+  }
+  /**
+   * Debug depth heatmap showing depth values as colors.
+   *
+   * Base64-encoded JPEG image showing the face region depth map as a heatmap:
+   * - Blue: Far (low depth/disparity)
+   * - Green/Yellow: Medium distance
+   * - Red: Close (high depth/disparity)
+   *
+   * Only present when enableDepthData is true and face detection succeeds.
+   *
+   * @platform iOS
+   */
+  debugDepthHeatmap?: string
 }
