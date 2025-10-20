@@ -117,7 +117,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     let orientation = getOrientation(forExifOrientation: cgOrientation)
     let isMirrored = getIsMirrored(forExifOrientation: cgOrientation)
 
-    // Try face cropping if depth data is available
+    // Process face detection and anti-spoofing (no cropping)
     var croppedImageBase64: String?
     var finalWidth: Any = exif?["PixelXDimension"] as Any
     var finalHeight: Any = exif?["PixelYDimension"] as Any
@@ -126,14 +126,11 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       do {
         print("orientation raw value: \(orientation)")
         print("isMirrored: \(isMirrored)")
-        let result = try processFaceCropping(photo: photo, exifOrientation: exifOrientation)
-        croppedImageBase64 = result.croppedImageBase64
-        finalWidth = result.croppedWidth
-        finalHeight = result.croppedHeight
+        let result = try processAntiSpoofing(photo: photo, exifOrientation: exifOrientation)
+        print("Anti-spoofing result: isTrueFace=\(result.isTrueFace), reason=\(result.reason)")
       } catch {
-        // Face cropping failed, continue with regular processing
-        // The error will be logged but won't fail the entire photo capture
-        print("Face cropping failed: \(error.localizedDescription)")
+        // Face detection failed, continue with regular processing
+        print("Face detection failed: \(error.localizedDescription)")
       }
     }
 
@@ -168,16 +165,15 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     ])
   }
 
-  private struct FaceCroppingResult {
-    let croppedImageBase64: String
-    let croppedWidth: Int
-    let croppedHeight: Int
+  private struct AntiSpoofingResult {
+    let isTrueFace: Bool
+    let reason: String
   }
 
-  private func processFaceCropping(
+  private func processAntiSpoofing(
     photo: AVCapturePhoto,
     exifOrientation: UInt32
-  ) throws -> FaceCroppingResult {
+  ) throws -> AntiSpoofingResult {
     // Extract image and metadata
     guard let imageData = photo.fileDataRepresentation(),
       let image = UIImage(data: imageData)
@@ -187,52 +183,31 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
     // Store for depth data processing later
     lastProcessedImageSize = image.size
-
-    // Detect single face with proper orientation and depth data for anti-spoofing
-    let faceObservation = try detectSingleFace(
-      in: image, photo: photo, exifOrientation: exifOrientation
-    )
-
-    // Use Vision framework results directly - no manual coordinate conversion needed
     let imageSize = image.size
+    // Detect single face with proper orientation and depth data for anti-spoofing
+    do {
+      let faceObservation = try detectSingleFace(
+        in: image, photo: photo, exifOrientation: exifOrientation
+      )
 
-    // Convert normalized coordinates to pixel coordinates
-    // Vision framework already handles orientation correctly
-    let faceRect = VNImageRectForNormalizedRect(
-      faceObservation.boundingBox,
-      Int(imageSize.width),
-      Int(imageSize.height)
-    )
+      // Essential debug info
+      print("Face bounding box: \(faceObservation.boundingBox)")
+      print("Image size: \(imageSize)")
 
-    // Essential debug info
-    print("Face rect: \(faceRect)")
-    print("Image size: \(imageSize)")
+      // Anti-spoofing passed - one unique face detected
+      return AntiSpoofingResult(
+        isTrueFace: true,
+        reason: "One and unique face recognized"
+      )
+    } catch {
+      // Handle no face detected case
+      print("No face recognized")
 
-    // Apply X-axis flip for mirrored images (front camera is always mirrored)
-    let finalFaceRect = CGRect(
-      x: imageSize.width - faceRect.maxX,  // Flip X-axis for mirrored
-      y: faceRect.origin.y,  // Keep Y-axis as is
-      width: faceRect.width,
-      height: faceRect.height
-    )
-    print("Flipped rect: \(finalFaceRect)")
-
-    // Store face rect for depth data processing later (use original Vision coordinates for depth processing)
-    lastProcessedFaceRect = faceRect
-
-    // Crop image with final coordinates
-    let croppedImage = try cropImage(image, to: finalFaceRect)
-
-    // Convert cropped image to base64
-    guard let croppedImageData = croppedImage.jpegData(compressionQuality: 1.0) else {
-      throw CameraError.capture(.unknown(message: "Failed to convert cropped image to JPEG"))
+      return AntiSpoofingResult(
+        isTrueFace: false,
+        reason: "No face detected"
+      )
     }
-
-    return FaceCroppingResult(
-      croppedImageBase64: croppedImageData.base64EncodedString(),
-      croppedWidth: Int(croppedImage.size.width),
-      croppedHeight: Int(croppedImage.size.height)
-    )
   }
 
   private func detectSingleFace(in image: UIImage, photo: AVCapturePhoto, exifOrientation: UInt32)
@@ -278,16 +253,17 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       cgOrientation = .up
     }
 
-    // Use standard image handler for now (depth data integration can be added later)
+    // Use standard face detection first
     let handler = VNImageRequestHandler(
       cgImage: cgImage, orientation: cgOrientation, options: [:]
     )
 
     if photo.depthData != nil {
-      print("Depth data available")
+      print("Depth data available for custom anti-spoofing analysis")
     } else {
       print("Using standard face detection (no depth data available)")
     }
+
     try handler.perform([request])
     semaphore.wait()
 
@@ -299,7 +275,171 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       throw CameraError.capture(.unknown(message: "Face detection failed"))
     }
 
+    // Custom anti-spoofing analysis using depth data
+    if let depthData = photo.depthData {
+      // Apply orientation to depth data to match image orientation
+      let orientedDepthData = depthData.applyingExifOrientation(cgOrientation)
+      print("Applied orientation \(cgOrientation.rawValue) to depth data")
+
+      let isRealFace = analyzeDepthAtFaceLocation(
+        depthData: orientedDepthData,
+        faceRect: face.boundingBox,
+        imageSize: CGSize(width: cgImage.width, height: cgImage.height)
+      )
+
+      if isRealFace {
+        print("One and unique face recognized - Custom anti-spoofing passed")
+      } else {
+        print("Face detected but failed custom anti-spoofing - possible spoofing")
+        throw CameraError.capture(
+          .unknown(message: "Anti-spoofing failed - possible 2D spoofing detected"))
+      }
+    } else {
+      print("One and unique face recognized - Standard detection (no depth data)")
+    }
+
     return face
+  }
+
+  private func analyzeDepthAtFaceLocation(
+    depthData: AVDepthData,
+    faceRect: CGRect,
+    imageSize: CGSize
+  ) -> Bool {
+    print("Analyzing depth data at face location for anti-spoofing")
+
+    // Get oriented depth map
+    let depthMap = depthData.depthDataMap
+    let depthWidth = CVPixelBufferGetWidth(depthMap)
+    let depthHeight = CVPixelBufferGetHeight(depthMap)
+
+    print("Depth map size: \(depthWidth)x\(depthHeight)")
+    print("Image size: \(imageSize.width)x\(imageSize.height)")
+    print("Face rect (normalized): \(faceRect)")
+
+    // Convert normalized face rect to pixel coordinates in the IMAGE space
+    let faceRectInImagePixels = CGRect(
+      x: faceRect.origin.x * imageSize.width,
+      y: faceRect.origin.y * imageSize.height,
+      width: faceRect.width * imageSize.width,
+      height: faceRect.height * imageSize.height
+    )
+    print("Face rect in image pixels: \(faceRectInImagePixels)")
+
+    // Now scale from image pixel coordinates to depth map pixel coordinates
+    let depthFaceRect = convertToDepthCoordinates(
+      faceRectInImagePixels,
+      from: imageSize,
+      to: CGSize(width: depthWidth, height: depthHeight)
+    )
+
+    print("Face rect in depth map pixels: \(depthFaceRect)")
+
+    // Lock depth buffer for reading
+    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+    guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
+      print("Failed to get depth map base address")
+      return false
+    }
+
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+    let pixelFormat = CVPixelBufferGetPixelFormatType(depthMap)
+
+    // Analyze depth values in face region
+    let faceX = Int(depthFaceRect.origin.x)
+    let faceY = Int(depthFaceRect.origin.y)
+    let faceWidth = Int(depthFaceRect.width)
+    let faceHeight = Int(depthFaceRect.height)
+
+    var depthValues: [Float] = []
+
+    // Sample depth values in face region based on actual pixel format
+    let bytesPerPixel = getBytesPerPixel(for: pixelFormat)
+    print("Depth format: \(pixelFormat), bytes per pixel: \(bytesPerPixel)")
+
+    // Determine if we're working with disparity or depth data
+    let isDisparityData =
+      pixelFormat == kCVPixelFormatType_DisparityFloat16
+      || pixelFormat == kCVPixelFormatType_DisparityFloat32
+    print("Data type: \(isDisparityData ? "Disparity" : "Depth")")
+
+    // Bounds check for face region
+    let safeStartX = max(0, faceX)
+    let safeStartY = max(0, faceY)
+    let safeEndX = min(faceX + faceWidth, depthWidth)
+    let safeEndY = min(faceY + faceHeight, depthHeight)
+
+    print("Sampling region: x=\(safeStartX)..\(safeEndX), y=\(safeStartY)..\(safeEndY)")
+
+    for y in safeStartY..<safeEndY {
+      for x in safeStartX..<safeEndX {
+        let pixelOffset = y * bytesPerRow + x * bytesPerPixel
+
+        let depthValue: Float
+        switch pixelFormat {
+        case kCVPixelFormatType_DepthFloat16:
+          let float16Value = baseAddress.load(fromByteOffset: pixelOffset, as: Float16.self)
+          depthValue = Float(float16Value)
+        case kCVPixelFormatType_DepthFloat32:
+          depthValue = baseAddress.load(fromByteOffset: pixelOffset, as: Float.self)
+        case kCVPixelFormatType_DisparityFloat16:
+          let float16Value = baseAddress.load(fromByteOffset: pixelOffset, as: Float16.self)
+          depthValue = Float(float16Value)
+        case kCVPixelFormatType_DisparityFloat32:
+          depthValue = baseAddress.load(fromByteOffset: pixelOffset, as: Float.self)
+        default:
+          print("Unsupported depth format: \(pixelFormat)")
+          continue
+        }
+
+        // Filter valid depth/disparity values
+        // Disparity: typically 0-2 (higher = closer)
+        // Depth: typically 0-10 meters (higher = farther)
+        let isValidValue: Bool
+        if isDisparityData {
+          // For disparity, valid values are typically 0.0 to 2.0
+          isValidValue = depthValue > 0 && depthValue < 5.0
+        } else {
+          // For depth, valid values are typically 0.0 to 10.0 meters
+          isValidValue = depthValue > 0 && depthValue < 10.0
+        }
+
+        if isValidValue {
+          depthValues.append(depthValue)
+        }
+      }
+    }
+
+    print("Collected \(depthValues.count) valid depth values")
+
+    // Analyze depth variation
+    guard !depthValues.isEmpty else {
+      print("No depth values found in face region")
+      return false
+    }
+
+    let minDepth = depthValues.min() ?? 0
+    let maxDepth = depthValues.max() ?? 0
+    let depthRange = maxDepth - minDepth
+    let avgDepth = depthValues.reduce(0, +) / Float(depthValues.count)
+
+    print(
+      "Depth analysis - Min: \(minDepth), Max: \(maxDepth), Range: \(depthRange), Avg: \(avgDepth), Count: \(depthValues.count)"
+    )
+
+    // Anti-spoofing logic: Real faces should have significant depth variation
+    // 2D screens/photos will have minimal depth variation
+    // For disparity data, variation is typically smaller than depth data
+    let minDepthVariation: Float = isDisparityData ? 0.05 : 0.1
+    let isRealFace = depthRange > minDepthVariation
+
+    print(
+      "Anti-spoofing result: \(isRealFace ? "Real face" : "Possible spoofing") - Depth range: \(depthRange) (threshold: \(minDepthVariation))"
+    )
+
+    return isRealFace
   }
 
   private func createPixelBuffer(from cgImage: CGImage) -> CVPixelBuffer? {
@@ -338,59 +478,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
     return buffer
-  }
-
-  private func testCoordinateTransformation(
-    imageSize: CGSize,
-    faceRect: CGRect,
-    flippedRect: CGRect,
-    orientation: UIImage.Orientation
-  ) {
-    print("=== COORDINATE TRANSFORMATION TEST ===")
-    print("Image: \(imageSize.width)x\(imageSize.height), Orientation: \(orientation)")
-    print("Vision rect: \(faceRect)")
-    print("Flipped rect: \(flippedRect)")
-
-    // Test if coordinates are within bounds
-    let imageBounds = CGRect(x: 0, y: 0, width: imageSize.width, height: imageSize.height)
-    let visionInBounds = imageBounds.contains(faceRect)
-    let flippedInBounds = imageBounds.contains(flippedRect)
-
-    print("Vision rect in bounds: \(visionInBounds)")
-    print("Flipped rect in bounds: \(flippedInBounds)")
-
-    // Test different coordinate systems
-    let testRect = CGRect(x: 100, y: 100, width: 200, height: 200)
-    let testFlipped = CGRect(
-      x: testRect.origin.x,
-      y: imageSize.height - testRect.maxY,
-      width: testRect.width,
-      height: testRect.height
-    )
-
-    print("Test rect: \(testRect)")
-    print("Test flipped: \(testFlipped)")
-    print("=== END TEST ===")
-  }
-
-  private func cropImage(_ image: UIImage, to rect: CGRect) throws -> UIImage {
-    guard let cgImage = image.cgImage else {
-      throw CameraError.capture(.unknown(message: "Failed to get CGImage"))
-    }
-
-    // Ensure crop rect is within image bounds
-    let imageRect = CGRect(x: 0, y: 0, width: image.size.width, height: image.size.height)
-    let clampedRect = rect.intersection(imageRect)
-
-    guard !clampedRect.isEmpty else {
-      throw CameraError.capture(.unknown(message: "Face region is outside image bounds"))
-    }
-
-    guard let croppedCGImage = cgImage.cropping(to: clampedRect) else {
-      throw CameraError.capture(.unknown(message: "Failed to crop image"))
-    }
-
-    return UIImage(cgImage: croppedCGImage, scale: image.scale, orientation: image.imageOrientation)
   }
 
   private func convertToDepthCoordinates(
