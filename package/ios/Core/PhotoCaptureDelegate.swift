@@ -89,7 +89,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     }
   }
 
-  private func shouldProcessFaceCropping(photo: AVCapturePhoto) -> Bool {
+  private func shouldProcessTrueDepth(photo: AVCapturePhoto) -> Bool {
     // Always try face cropping when depth data is available
     let hasDepthData = photo.depthData != nil
     let hasImageData = photo.fileDataRepresentation() != nil
@@ -121,12 +121,9 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     var finalWidth: Any = exif?["PixelXDimension"] as Any
     var finalHeight: Any = exif?["PixelYDimension"] as Any
 
-    if shouldProcessFaceCropping(photo: photo) {
+    if shouldProcessTrueDepth(photo: photo) {
       do {
-        print("orientation raw value: \(orientation)")
-        print("isMirrored: \(isMirrored)")
         let result = try processAntiSpoofing(photo: photo, exifOrientation: exifOrientation)
-        print("Anti-spoofing result: isTrueFace=\(result.isTrueFace), reason=\(result.reason)")
       } catch {
         // Face detection failed, continue with regular processing
         print("Face detection failed: \(error.localizedDescription)")
@@ -202,7 +199,9 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
     let semaphore = DispatchSemaphore(value: 0)
 
-    let request = VNDetectFaceRectanglesRequest { request, error in
+    // Use VNDetectFaceLandmarksRequest instead of VNDetectFaceRectanglesRequest
+    // This gives us actual nose position for more accurate depth sampling
+    let request = VNDetectFaceLandmarksRequest { request, error in
       if let error = error {
         detectionError = error
       } else if let results = request.results as? [VNFaceObservation] {
@@ -222,27 +221,14 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     // Use the exifOrientation from processPhoto function
     let cgOrientation: CGImagePropertyOrientation
     if let orientation = CGImagePropertyOrientation(rawValue: exifOrientation) {
-      print(
-        "exifOrientation used for face detection: \(exifOrientation) and brut force orientation: \(orientation)"
-      )
       cgOrientation = orientation
     } else {
-      print(
-        "Warning: Failed to convert exifOrientation to CGImagePropertyOrientation, using .up as fallback"
-      )
       cgOrientation = .up
     }
 
-    // Use standard face detection first
     let handler = VNImageRequestHandler(
       cgImage: cgImage, orientation: cgOrientation, options: [:]
     )
-
-    if photo.depthData != nil {
-      print("Depth data available for custom anti-spoofing analysis")
-    } else {
-      print("Using standard face detection (no depth data available)")
-    }
 
     try handler.perform([request])
     semaphore.wait()
@@ -259,31 +245,24 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     if let depthData = photo.depthData {
       // Apply orientation to depth data to match image orientation
       let orientedDepthData = depthData.applyingExifOrientation(cgOrientation)
-      print("Applied orientation \(cgOrientation.rawValue) to depth data")
 
-      // Create debug heatmap FIRST (before anti-spoofing check)
-      // This ensures we get the heatmap even if anti-spoofing fails
       lastDepthHeatmap = createDepthHeatmap(
         depthData: orientedDepthData,
-        faceRect: face.boundingBox,
+        faceObservation: face,
         imageSize: CGSize(width: cgImage.width, height: cgImage.height)
       )
 
       let isRealFace = analyzeDepthAtFaceLocation(
         depthData: orientedDepthData,
-        faceRect: face.boundingBox,
+        faceObservation: face,
         imageSize: CGSize(width: cgImage.width, height: cgImage.height)
       )
 
       if isRealFace {
-        print("One and unique face recognized - Custom anti-spoofing passed")
       } else {
-        print("Face detected but failed custom anti-spoofing - possible spoofing")
         throw CameraError.capture(
           .unknown(message: "Anti-spoofing failed - possible 2D spoofing detected"))
       }
-    } else {
-      print("One and unique face recognized - Standard detection (no depth data)")
     }
 
     return face
@@ -305,15 +284,16 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
   private func analyzeDepthAtFaceLocation(
     depthData: AVDepthData,
-    faceRect: CGRect,
+    faceObservation: VNFaceObservation,
     imageSize: CGSize
   ) -> Bool {
-    print("🔍 Multi-factor anti-spoofing analysis started")
 
     // Get oriented depth map
     let depthMap = depthData.depthDataMap
     let depthWidth = CVPixelBufferGetWidth(depthMap)
     let depthHeight = CVPixelBufferGetHeight(depthMap)
+
+    let faceRect = faceObservation.boundingBox
 
     // Convert normalized face rect to pixel coordinates
     let faceRectInImagePixels = CGRect(
@@ -334,7 +314,6 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
     guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
-      print("❌ Failed to get depth map base address")
       return false
     }
 
@@ -364,12 +343,67 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
     var centerDepthValues: [Float] = []
     var edgeDepthValues: [Float] = []
 
-    // Define center region (middle 40% of face)
-    let centerMargin = 0.3
-    let centerStartX = safeStartX + Int(Float(faceWidth) * Float(centerMargin))
-    let centerEndX = safeEndX - Int(Float(faceWidth) * Float(centerMargin))
-    let centerStartY = safeStartY + Int(Float(faceHeight) * Float(centerMargin))
-    let centerEndY = safeEndY - Int(Float(faceHeight) * Float(centerMargin))
+    // Try to get actual nose position from landmarks
+    var noseCenter: CGPoint?
+    if let noseCrest = faceObservation.landmarks?.noseCrest,
+      let nosePoints = noseCrest.normalizedPoints as [CGPoint]?,
+      !nosePoints.isEmpty
+    {
+      // Calculate center of nose crest points
+      let sumX = nosePoints.reduce(0.0) { $0 + $1.x }
+      let sumY = nosePoints.reduce(0.0) { $0 + $1.y }
+      let avgX = sumX / CGFloat(nosePoints.count)
+      let avgY = sumY / CGFloat(nosePoints.count)
+
+      // Convert from landmark coordinates (relative to face bbox) to normalized image coordinates
+      noseCenter = CGPoint(
+        x: faceRect.origin.x + avgX * faceRect.width,
+        y: faceRect.origin.y + avgY * faceRect.height
+      )
+
+      print("👃 Using actual nose landmarks for center detection")
+    }
+
+    // Define center region based on nose position or geometric center
+    let centerStartX: Int
+    let centerEndX: Int
+    let centerStartY: Int
+    let centerEndY: Int
+
+    if let nose = noseCenter {
+      // Use actual nose position: sample 20% radius around nose
+      let noseInImagePixels = CGPoint(
+        x: nose.x * imageSize.width,
+        y: (1.0 - nose.y) * imageSize.height  // Flip Y-axis
+      )
+      let noseInDepth = CGPoint(
+        x: noseInImagePixels.x * CGFloat(depthWidth) / imageSize.width,
+        y: noseInImagePixels.y * CGFloat(depthHeight) / imageSize.height
+      )
+
+      let radiusX = Int(Float(faceWidth) * 0.2)
+      let radiusY = Int(Float(faceHeight) * 0.2)
+
+      centerStartX = max(safeStartX, Int(noseInDepth.x) - radiusX)
+      centerEndX = min(safeEndX, Int(noseInDepth.x) + radiusX)
+      centerStartY = max(safeStartY, Int(noseInDepth.y) - radiusY)
+      centerEndY = min(safeEndY, Int(noseInDepth.y) + radiusY)
+
+      print(
+        "  Center region: Nose-based (\(centerStartX)-\(centerEndX), \(centerStartY)-\(centerEndY))"
+      )
+    } else {
+      // Fallback to geometric center (60% center region for better coverage)
+      let centerMargin = 0.2  // 60% center (was 40%)
+      centerStartX = safeStartX + Int(Float(faceWidth) * Float(centerMargin))
+      centerEndX = safeEndX - Int(Float(faceWidth) * Float(centerMargin))
+      centerStartY = safeStartY + Int(Float(faceHeight) * Float(centerMargin))
+      centerEndY = safeEndY - Int(Float(faceHeight) * Float(centerMargin))
+
+      print(
+        "  Center region: Geometric fallback (\(centerStartX)-\(centerEndX), \(centerStartY)-\(centerEndY))"
+      )
+    }
 
     let totalPixels = (safeEndX - safeStartX) * (safeEndY - safeStartY)
     var validPixelCount = 0
@@ -580,12 +614,14 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
 
   private func createDepthHeatmap(
     depthData: AVDepthData,
-    faceRect: CGRect,
+    faceObservation: VNFaceObservation,
     imageSize: CGSize
   ) -> String? {
     let depthMap = depthData.depthDataMap
     let depthWidth = CVPixelBufferGetWidth(depthMap)
     let depthHeight = CVPixelBufferGetHeight(depthMap)
+
+    let faceRect = faceObservation.boundingBox
 
     // Convert face rect to depth coordinates
     // Vision framework uses bottom-left origin, UIImage uses top-left origin
@@ -705,6 +741,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
   }
 
   // MARK: - Helper Functions
+
   private func getBytesPerPixel(for pixelFormat: OSType) -> Int {
     switch pixelFormat {
     case kCVPixelFormatType_DepthFloat16:
@@ -721,6 +758,7 @@ class PhotoCaptureDelegate: GlobalReferenceHolder, AVCapturePhotoCaptureDelegate
       return 4  // Default to 4 bytes, but this will be overridden by actual calculation
     }
   }
+
   private func getOrientation(forExifOrientation exifOrientation: CGImagePropertyOrientation)
     -> String
   {
