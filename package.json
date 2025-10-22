@@ -1,12 +1,30 @@
 {
-  "name": "monorepo",
-  "private": true,
-  "workspaces": [
-    "package",
-    "example",
-    "docs"
+  "name": "react-native-vision-camera",
+  "version": "4.7.2",
+  "description": "A powerful, high-performance React Native Camera library.",
+  "main": "package/lib/commonjs/index",
+  "module": "package/lib/module/index",
+  "types": "package/lib/typescript/index.d.ts",
+  "react-native": "package/src/index",
+  "files": [
+    "package/"
   ],
-  "trustedDependencies": [
-    "react-native-vision-camera"
-  ]
+  "peerDependencies": {
+    "@shopify/react-native-skia": "*",
+    "react": "*",
+    "react-native": "*",
+    "react-native-reanimated": "*",
+    "react-native-worklets-core": "*"
+  },
+  "peerDependenciesMeta": {
+    "react-native-worklets-core": {
+      "optional": true
+    },
+    "react-native-reanimated": {
+      "optional": true
+    },
+    "@shopify/react-native-skia": {
+      "optional": true
+    }
+  }
 }
